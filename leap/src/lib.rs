@@ -444,6 +444,7 @@ impl CasetaLeap {
                 driver_id: BRIDGE_ID.into(),
                 properties: props,
                 verified: "paired".into(),
+                            ..Default::default()
             });
         }
 
@@ -472,10 +473,11 @@ impl CasetaLeap {
                 driver_id: DIMMER_ID.into(),
                 properties: props,
                 verified: "found on bridge".into(),
+                            ..Default::default()
             });
         }
 
-        (SetupStep::Done { devices: out }, Value::Null)
+        (SetupStep::done(out), Value::Null)
     }
 }
 
@@ -483,7 +485,7 @@ impl DriverModule for CasetaLeap {
     fn discover(&self, driver_id: &str, state: &Value, input: &Args) -> (SetupStep, Value) {
         if driver_id != BRIDGE_ID {
             // Dimmers are found by browsing their bridge, never set up on their own.
-            return (SetupStep::Done { devices: Vec::new() }, Value::Null);
+            return (SetupStep::done(Vec::new()), Value::Null);
         }
 
         // Browsing a bridge that is paired already: core seeded `state` with its properties
