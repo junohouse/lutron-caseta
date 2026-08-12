@@ -3,7 +3,7 @@ id = "lutron.caseta.leap_bridge"
 name = "Lutron Caséta Smart Bridge"
 manufacturer = "Lutron"
 version = "1.0.0"
-runtime = "native"
+runtime = "wasm"
 
 # The bridge holds the paired identity — address, client certificate, client key — so every
 # device behind it inherits them rather than carrying its own copy. Pair once; a dimmer added

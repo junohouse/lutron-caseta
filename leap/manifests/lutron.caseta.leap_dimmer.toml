@@ -3,7 +3,7 @@ id = "lutron.caseta.leap_dimmer"
 name = "Lutron Caséta Dimmer (LEAP)"
 manufacturer = "Lutron"
 version = "1.0.0"
-runtime = "native"
+runtime = "wasm"
 parent = "lutron.caseta.leap_bridge"
 
 # Found and adopted through the bridge's own setup flow, not on its own — see
