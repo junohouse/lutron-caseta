@@ -15,6 +15,9 @@ type = "bridge"
 primary = true
 capabilities = { child_driver = "lutron.caseta.leap_dimmer", max_children = 0 }
 
+[children]
+proxies = ["light", "keypad"]
+
 [[property]]
 name = "Address"
 type = "string"

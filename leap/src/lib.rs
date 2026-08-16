@@ -1,10 +1,11 @@
 //! Lutron Caséta over LEAP — the bridge's TLS API port, as opposed to the PRO-only plaintext
 //! integration port `lutron.caseta.dimmer` speaks.
 //!
-//! Two manifests share this one module: `lutron.caseta.leap_bridge` (the parent — pairing
-//! lives here) and `lutron.caseta.leap_dimmer` (a zone behind it). A dimmer is never set up on
-//! its own; it is found by browsing an already-paired bridge, the same way a Hue bulb is found
-//! by browsing a Hue bridge.
+//! Three manifests share this one module: `lutron.caseta.leap_bridge` (the parent — pairing
+//! lives here), `lutron.caseta.leap_dimmer` (a zone behind it) and `lutron.caseta.leap_pico`
+//! (a battery remote behind it). Neither child is ever set up on its own; both are found by
+//! browsing an already-paired bridge, the same way a Hue bulb is found by browsing a Hue
+//! bridge.
 //!
 //! LEAP itself is not HTTP. It is one JSON object per line over a TLS socket:
 //!
@@ -14,8 +15,9 @@
 //!   bridge to push confirmation that its button was physically pressed, then submit a CSR
 //!   and get back a certificate signed for this installation specifically.
 //! - Port 8081, mutual TLS with that certificate: everything else. A `ReadRequest` for
-//!   `/device` lists what is paired; a `SubscribeRequest` on a zone's `/status` is how a wall
-//!   dimmer press reaches us without polling.
+//!   `/device` lists what is paired, `/buttongroup` lists a Pico's buttons; a
+//!   `SubscribeRequest` on a zone's `/status` or a button's `/status/event` is how a press —
+//!   on the wall or on a remote — reaches us without polling.
 //!
 //! **The controller has no idea any of this is going on, and that is the point.** LEAP used
 //! to live in core: the ports, the line framing, skipping the acknowledgements a bridge
@@ -42,6 +44,7 @@ use std::collections::BTreeMap;
 
 const BRIDGE_ID: &str = "lutron.caseta.leap_bridge";
 const DIMMER_ID: &str = "lutron.caseta.leap_dimmer";
+const PICO_ID: &str = "lutron.caseta.leap_pico";
 
 /// `control: 0` is the driver's own network transport — core owns the socket.
 const NET: LocalId = 0;
@@ -399,7 +402,10 @@ impl CasetaLeap {
         ))
     }
 
-    fn request_device_list(state: &Value) -> (SetupStep, Value) {
+    /// Address, client certificate and client key, wherever in `state` they currently live —
+    /// under the bridge's own property names once adopted, under the pairing flow's names
+    /// before that. Shared by every read this driver makes against the bridge.
+    fn bridge_identity(state: &Value) -> (String, String, String) {
         let address = {
             let v = field(state, "Address");
             if v.is_empty() { field(state, "address") } else { v }
@@ -412,6 +418,11 @@ impl CasetaLeap {
             let v = field(state, "Client key");
             if v.is_empty() { field(state, "key_pem") } else { v }
         };
+        (address, cert, key)
+    }
+
+    fn request_device_list(state: &Value) -> (SetupStep, Value) {
+        let (address, cert, key) = Self::bridge_identity(state);
         let body = json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": "/device" } });
         (
             SetupStep::Session {
@@ -428,17 +439,72 @@ impl CasetaLeap {
         )
     }
 
-    /// Turn a `/device` reply into candidates. Only dimmable outputs are offered — a Pico
-    /// remote or an occupancy sensor found on the same bridge is real Caséta hardware this
-    /// driver does not model yet, so it is silently skipped rather than offered and failing.
+    /// Turn a `/device` reply into candidates — or, if a Pico is behind this bridge, into one
+    /// more read first. A button lives in `/buttongroup`, a separate collection `/device`
+    /// only points at, so a Pico cannot be offered from this reply alone the way a dimmer can.
+    ///
+    /// Reads `received`/`leap_answer` rather than a pre-parsed `response`, the same as every
+    /// other reply on this connection — `SetupStep::Session` never hands back the latter, only
+    /// `SetupStep::Fetch` (an HTTP call this driver does not make) does.
     fn handle_device_list(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
-        let response = input.get("response").cloned().unwrap_or(Value::Null);
+        let response = leap_answer(input.get("received").and_then(Value::as_str).unwrap_or(""));
         let devices = response
             .pointer("/Body/Devices")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
 
+        let any_pico = devices
+            .iter()
+            .any(|d| is_pico(d.get("DeviceType").and_then(Value::as_str).unwrap_or("")));
+        if any_pico {
+            return Self::request_button_groups(state, include_bridge, devices);
+        }
+        (SetupStep::done(Self::candidates(state, include_bridge, &devices, &[])), Value::Null)
+    }
+
+    /// One more read, made only when something found in `/device` needs it — most bridges have
+    /// no Pico behind them and never pay for this round trip.
+    fn request_button_groups(state: &Value, include_bridge: bool, devices: Vec<Value>) -> (SetupStep, Value) {
+        let (address, cert, key) = Self::bridge_identity(state);
+        let body = json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": "/buttongroup" } });
+
+        let mut next = with_fields(
+            state,
+            &[("stage", "listing_buttons"), ("include_bridge", if include_bridge { "true" } else { "false" })],
+        );
+        if let Value::Object(ref mut m) = next {
+            // Carried across this round trip as plain JSON, the same as everything else in
+            // `state` — discarded the moment `candidates` below has consumed it.
+            m.insert("devices_json".into(), Value::Array(devices));
+        }
+        (
+            SetupStep::Session {
+                session: None,
+                open: Some(Connect::mutual_tls(address, LEAP_PORT, cert, key)),
+                accept: None,
+                send: leap_line(&body),
+                send_bytes: Vec::new(),
+                read_ms: 6000,
+                close: true,
+                note: "list".into(),
+            },
+            next,
+        )
+    }
+
+    fn handle_button_groups(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
+        let response = leap_answer(input.get("received").and_then(Value::as_str).unwrap_or(""));
+        let groups = response
+            .pointer("/Body/ButtonGroups")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let devices: Vec<Value> = state.get("devices_json").and_then(Value::as_array).cloned().unwrap_or_default();
+        (SetupStep::done(Self::candidates(state, include_bridge, &devices, &groups)), Value::Null)
+    }
+
+    fn candidates(state: &Value, include_bridge: bool, devices: &[Value], button_groups: &[Value]) -> Vec<Candidate> {
         let mut out = Vec::new();
         if include_bridge {
             let mut props = BTreeMap::new();
@@ -452,41 +518,76 @@ impl CasetaLeap {
                 driver_id: BRIDGE_ID.into(),
                 properties: props,
                 verified: "paired".into(),
-                            ..Default::default()
+                ..Default::default()
             });
         }
 
-        // ponytail: dimmers only, matching the integration-port driver's scope. Switches,
-        // keypads, and Pico remotes are real LEAP device types too — add a DeviceType arm
-        // here plus a manifest for each when one is needed.
+        // ponytail: dimmers and Picos only. Switches, RA2-style wired keypads, and occupancy
+        // sensors are real LEAP device types too — add a DeviceType arm here plus a manifest
+        // for each when one is needed.
         const DIMMABLE: &[&str] = &["WallDimmer", "PlugInDimmer", "InLineDimmer", "Dimmed"];
-        for d in &devices {
+        for d in devices {
             let kind = d.get("DeviceType").and_then(Value::as_str).unwrap_or("");
-            if !DIMMABLE.contains(&kind) {
+            let name = d.get("Name").and_then(Value::as_str).unwrap_or("Caséta device").to_string();
+
+            if DIMMABLE.contains(&kind) {
+                let Some(zone) = d.pointer("/LocalZones/0/href").and_then(Value::as_str) else {
+                    continue; // no zone means nothing to command
+                };
+                let mut props = BTreeMap::new();
+                props.insert("Zone".into(), json!(zone));
+                out.push(Candidate {
+                    label: name,
+                    kind: "light".into(),
+                    driver_id: DIMMER_ID.into(),
+                    properties: props,
+                    verified: "found on bridge".into(),
+                    ..Default::default()
+                });
                 continue;
             }
-            let Some(zone) = d.pointer("/LocalZones/0/href").and_then(Value::as_str) else {
-                continue; // no zone means nothing to command
-            };
-            let name = d
-                .get("Name")
-                .and_then(Value::as_str)
-                .unwrap_or("Caséta Dimmer")
-                .to_string();
-            let mut props = BTreeMap::new();
-            props.insert("Zone".into(), json!(zone));
-            out.push(Candidate {
-                label: name,
-                kind: "light".into(),
-                driver_id: DIMMER_ID.into(),
-                properties: props,
-                verified: "found on bridge".into(),
-                            ..Default::default()
-            });
+
+            if is_pico(kind) {
+                let Some(href) = d.get("href").and_then(Value::as_str) else { continue };
+                let buttons = pico_button_hrefs(href, button_groups);
+                if buttons.is_empty() {
+                    continue; // no buttons found for it means nothing to subscribe to
+                }
+                let mut props = BTreeMap::new();
+                for (i, b) in buttons.iter().take(5).enumerate() {
+                    props.insert(format!("Button {} href", i + 1), json!(b));
+                }
+                out.push(Candidate {
+                    label: name,
+                    kind: "keypad".into(),
+                    driver_id: PICO_ID.into(),
+                    properties: props,
+                    verified: "found on bridge".into(),
+                    ..Default::default()
+                });
+            }
         }
 
-        (SetupStep::done(out), Value::Null)
+        out
     }
+}
+
+/// Any Pico remote — `Pico2Button`, `Pico3ButtonRaiseLower`, `Pico4Button` and the rest all
+/// start with it, and this driver treats every one of them the same way (see `PICO_ID`'s
+/// manifest for the ceiling that puts a real name on).
+fn is_pico(device_type: &str) -> bool {
+    device_type.starts_with("Pico")
+}
+
+/// This Pico's button hrefs, in the order the bridge lists them — physical order, since Lutron
+/// assigns them at commissioning top to bottom.
+fn pico_button_hrefs<'a>(device_href: &str, button_groups: &'a [Value]) -> Vec<&'a str> {
+    button_groups
+        .iter()
+        .filter(|g| g.pointer("/Parent/href").and_then(Value::as_str) == Some(device_href))
+        .flat_map(|g| g.pointer("/Buttons").and_then(Value::as_array).into_iter().flatten())
+        .filter_map(|b| b.get("href").and_then(Value::as_str))
+        .collect()
 }
 
 impl DriverModule for CasetaLeap {
@@ -497,12 +598,14 @@ impl DriverModule for CasetaLeap {
         }
 
         // Browsing a bridge that is paired already: core seeded `state` with its properties
-        // directly, so there is nothing to pair — go straight to listing.
+        // directly, so there is nothing to pair — go straight to listing, then whatever
+        // Picos found there need one more read for their buttons, same as first-time pairing.
         if state.get("browse").and_then(Value::as_bool) == Some(true) {
-            if input.get("response").is_some() || input.get("error").is_some() {
-                return Self::handle_device_list(state, input, false);
-            }
-            return Self::request_device_list(state);
+            return match field(state, "stage").as_str() {
+                "listing" => Self::handle_device_list(state, input, false),
+                "listing_buttons" => Self::handle_button_groups(state, input, false),
+                _ => Self::request_device_list(&with_fields(state, &[("stage", "listing")])),
+            };
         }
 
         match field(state, "stage").as_str() {
@@ -513,17 +616,22 @@ impl DriverModule for CasetaLeap {
             "pairing" => Self::await_button_press(state, input),
             "pair_sent" => Self::handle_pair_response(state, input),
             "listing" => Self::handle_device_list(state, input, true),
+            "listing_buttons" => Self::handle_button_groups(state, input, true),
             _ => Self::ask_address(state, input),
         }
     }
 
     fn on_command(&self, inst: &mut Instance, _proxy: LocalId, cmd: &str, args: &Args) -> Vec<HostCall> {
-        // The bridge proxy takes no commands (see its manifest) — anything reaching here is
-        // for the dimmer's light proxy.
+        // The bridge and a Pico's keypad proxy both take no commands (see their manifests) —
+        // anything reaching here is for the dimmer's light proxy.
         Self::on_dimmer_command(inst, cmd, args)
     }
 
     fn on_event(&self, inst: &mut Instance, _control: LocalId, note: &str, args: &Args) -> Vec<HostCall> {
+        let buttons = pico_buttons(inst);
+        if !buttons.is_empty() {
+            return Self::on_pico_event(&buttons, note, args);
+        }
         Self::on_dimmer_event(inst, note, args)
     }
 
@@ -532,10 +640,13 @@ impl DriverModule for CasetaLeap {
         a.insert("online".into(), json!(true));
         let mut out = vec![HostCall::notify(1, "online_changed", a)];
 
-        // Only a dimmer has a zone to subscribe to; a bridge instance binding has nothing
-        // further to do here — pairing already happened in its setup flow.
+        // A dimmer has a zone to subscribe to; a Pico has buttons instead; a bridge instance
+        // binding has nothing further to do here — pairing already happened in its setup flow.
         if let Some(z) = zone(inst) {
             out.push(tx(&subscribe(&z)));
+        }
+        for (_, href) in pico_buttons(inst) {
+            out.push(tx(&subscribe_button(&href)));
         }
         out
     }
@@ -550,6 +661,18 @@ fn zone(inst: &Instance) -> Option<String> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// This instance's button hrefs, numbered as its manifest properties are — empty for
+/// anything that is not a Pico, which is how a bridge or a dimmer binding tells `on_event`
+/// and `on_bind` it is neither.
+fn pico_buttons(inst: &Instance) -> Vec<(u64, String)> {
+    (1..=5)
+        .filter_map(|n| {
+            let href = inst.property(&format!("Button {n} href")).as_str()?;
+            (!href.is_empty()).then(|| (n, href.to_string()))
+        })
+        .collect()
 }
 
 fn fade_time(seconds: u64) -> String {
@@ -577,6 +700,10 @@ fn go_to_level(zone: &str, level: u8, fade_secs: u64) -> Value {
 
 fn subscribe(zone: &str) -> Value {
     json!({ "CommuniqueType": "SubscribeRequest", "Header": { "Url": format!("{zone}/status") } })
+}
+
+fn subscribe_button(href: &str) -> Value {
+    json!({ "CommuniqueType": "SubscribeRequest", "Header": { "Url": format!("{href}/status/event") } })
 }
 
 fn report(level: u8) -> HostCall {
@@ -662,6 +789,47 @@ impl CasetaLeap {
         }
         out
     }
+
+    /// `buttons` is this instance's own hrefs, from `pico_buttons` — the same list `on_bind`
+    /// subscribed with, so a press on someone else's Pico read over the same connection is
+    /// never mistaken for one of these.
+    fn on_pico_event(buttons: &[(u64, String)], note: &str, args: &Args) -> Vec<HostCall> {
+        if note != "rx" {
+            return Vec::new();
+        }
+        let Some(text) = args.get("data").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for line in text.split('\n').map(str::trim).filter(|l| !l.is_empty()) {
+            let Ok(msg) = driver_sdk::serde_json::from_str::<Value>(line) else { continue };
+            let Some(status) = msg.pointer("/Body/ButtonStatus") else { continue };
+            let href = status.pointer("/Button/href").and_then(Value::as_str).unwrap_or("");
+            let Some(key) = buttons.iter().find(|(_, h)| h == href).map(|(k, _)| *k) else {
+                continue; // someone else's Pico, on the same event stream
+            };
+            // Only Press/Release is real on Caséta's own bridge — Lutron leaves click/hold
+            // timing to whoever is listening rather than doing it on-device, which is why
+            // this manifest declares neither `has_hold` nor `has_double`.
+            let name = match status.pointer("/ButtonEvent/EventType").and_then(Value::as_str) {
+                Some("Press") => "pressed",
+                Some("Release") => "released",
+                _ => continue, // a firmware shape this driver does not know yet
+            };
+            let mut a = Args::new();
+            a.insert("key".into(), json!(key));
+            out.push(HostCall::notify(1, name, a));
+            // Same reasoning as the dimmer's own tile: a keypad has nothing else to draw, and
+            // one showing blank forever reads as broken rather than idle.
+            out.push(HostCall::SetState {
+                proxy: 1,
+                key: "last_action".into(),
+                value: json!(format!("key {key} {name}")),
+            });
+        }
+        out
+    }
 }
 
 export_driver!(CasetaLeap);
@@ -710,5 +878,74 @@ mod tests {
         assert!(line.ends_with('\n'), "the bridge reads by line");
         assert_eq!(line.matches('\n').count(), 1);
         assert_eq!(leap_answer(&line)["Header"]["Url"], "/device");
+    }
+
+    #[test]
+    fn every_pico_device_type_is_recognised_by_its_prefix() {
+        assert!(is_pico("Pico2Button"));
+        assert!(is_pico("Pico3ButtonRaiseLower"));
+        assert!(is_pico("Pico4Button"));
+        assert!(!is_pico("WallDimmer"));
+        assert!(!is_pico("Dimmed"));
+        assert!(!is_pico(""));
+    }
+
+    #[test]
+    fn a_picos_buttons_come_from_the_group_that_belongs_to_it_in_bridge_order() {
+        let groups = vec![
+            json!({
+                "Parent": { "href": "/device/9" },
+                "Buttons": [{ "href": "/button/50" }, { "href": "/button/51" }],
+            }),
+            json!({
+                "Parent": { "href": "/device/8" },
+                "Buttons": [
+                    { "href": "/button/9" },
+                    { "href": "/button/10" },
+                    { "href": "/button/11" },
+                ],
+            }),
+        ];
+        assert_eq!(
+            pico_button_hrefs("/device/8", &groups),
+            vec!["/button/9", "/button/10", "/button/11"]
+        );
+        // A device with no button group at all — an occupancy sensor, say — gets nothing to
+        // subscribe to rather than a button that belongs to somebody else's remote.
+        assert!(pico_button_hrefs("/device/404", &groups).is_empty());
+    }
+
+    #[test]
+    fn a_pico_event_reports_only_its_own_button_and_only_press_or_release() {
+        let buttons = vec![(1u64, "/button/9".to_string()), (2u64, "/button/10".to_string())];
+        let mut args = Args::new();
+        args.insert(
+            "data".into(),
+            json!(concat!(
+                // Somebody else's Pico on the same event stream — must be ignored.
+                "{\"Body\":{\"ButtonStatus\":{\"Button\":{\"href\":\"/button/99\"},",
+                "\"ButtonEvent\":{\"EventType\":\"Press\"}}}}\n",
+                "{\"Body\":{\"ButtonStatus\":{\"Button\":{\"href\":\"/button/10\"},",
+                "\"ButtonEvent\":{\"EventType\":\"Press\"}}}}\n",
+                "{\"Body\":{\"ButtonStatus\":{\"Button\":{\"href\":\"/button/10\"},",
+                "\"ButtonEvent\":{\"EventType\":\"Release\"}}}}\n",
+            )),
+        );
+        let calls = CasetaLeap::on_pico_event(&buttons, "rx", &args);
+
+        let notify_names: Vec<&str> = calls
+            .iter()
+            .filter_map(|c| match c {
+                HostCall::Notify { name, args, .. } if args.get("key") == Some(&json!(2)) => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notify_names, vec!["pressed", "released"]);
+
+        // An event that is neither Press nor Release, and one whose note is not `rx` at all:
+        // both produce nothing rather than a guess.
+        assert!(CasetaLeap::on_pico_event(&buttons, "not-rx", &args).is_empty());
     }
 }

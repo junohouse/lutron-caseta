@@ -4,7 +4,7 @@ Caséta dimmers over LEAP, the TLS protocol every current Smart Bridge speaks.
 
 | Package | Drivers | Needs |
 | --- | --- | --- |
-| [`leap/`](leap) | `lutron.caseta.leap_bridge`, `lutron.caseta.leap_dimmer` | Any current Smart Bridge |
+| [`leap/`](leap) | `lutron.caseta.leap_bridge`, `lutron.caseta.leap_dimmer`, `lutron.caseta.leap_pico` | Any current Smart Bridge |
 
 There was a second package, `integration/`, driving the Smart Bridge PRO's telnet integration
 port as `lutron.caseta.dimmer`. Only the PRO bridge ever exposed that port — on a standard

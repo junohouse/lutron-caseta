@@ -1,0 +1,55 @@
+[driver]
+id = "lutron.caseta.leap_pico"
+name = "Lutron Pico Remote"
+manufacturer = "Lutron"
+version = "1.0.0"
+runtime = "wasm"
+parent = "lutron.caseta.leap_bridge"
+
+# Found and adopted through the bridge's own setup flow, not on its own — see
+# `lutron.caseta.leap_bridge`. One binding for the whole remote, with which button was
+# pressed travelling as a `key` parameter — the same shape signify.hue.dimmer uses for its
+# own battery remotes, and for the same reason: "the raise button was pressed" should not
+# require the remote to be four separate devices.
+[[proxy]]
+id = 1
+type = "keypad"
+primary = true
+# ponytail: every Pico (2 to 5 buttons, on/raise/stop/lower/off at most) shares this one
+# manifest with 5 generic key slots — a 2-button Pico just never sets "Button 3/4/5 href"
+# and those keys never fire. Split into per-model manifests (mirroring signify.hue's
+# dimmer/smart_button/wall_switch) with real labels once each DeviceType string is confirmed
+# against real hardware. `has_hold`/`has_double`/`has_repeat` are left unset on purpose —
+# Caséta's own bridge reports raw Press/Release only, with no on-device gesture timing.
+capabilities = { key_count = 5, key_labels = "Button 1,Button 2,Button 3,Button 4,Button 5" }
+
+[[transport]]
+kind = "network"
+port = 8081
+tls = true
+keepalive = true
+
+[[property]]
+name = "Button 1 href"
+type = "string"
+tooltip = "LEAP href of the first button — filled in automatically when adopted"
+
+[[property]]
+name = "Button 2 href"
+type = "string"
+tooltip = "LEAP href of the second button — filled in automatically when adopted"
+
+[[property]]
+name = "Button 3 href"
+type = "string"
+tooltip = "LEAP href of the third button — filled in automatically when adopted"
+
+[[property]]
+name = "Button 4 href"
+type = "string"
+tooltip = "LEAP href of the fourth button — filled in automatically when adopted"
+
+[[property]]
+name = "Button 5 href"
+type = "string"
+tooltip = "LEAP href of the fifth button — filled in automatically when adopted"
