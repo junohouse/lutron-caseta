@@ -841,7 +841,7 @@ mod tests {
     /// The two pieces of Lutron knowledge that used to live in the controller.
     ///
     /// A bridge volunteers acknowledgements ahead of the reply you asked for, and announces a
-    /// button press unprompted. Neither is something a generic transport could recognise —
+    /// button press unprompted. Neither is something a generic transport could recognize —
     /// which is the whole reason this logic belongs to the driver.
     #[test]
     fn the_answer_is_picked_out_from_what_the_bridge_volunteered() {
@@ -861,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn a_button_press_is_recognised_only_from_the_bridges_own_push() {
+    fn a_button_press_is_recognized_only_from_the_bridges_own_push() {
         let pressed = "{\"Body\":{\"Status\":{\"Permissions\":[\"PhysicalAccess\"]}}}\n";
         assert!(CasetaLeap::button_pressed(pressed));
 
@@ -881,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn every_pico_device_type_is_recognised_by_its_prefix() {
+    fn every_pico_device_type_is_recognized_by_its_prefix() {
         assert!(is_pico("Pico2Button"));
         assert!(is_pico("Pico3ButtonRaiseLower"));
         assert!(is_pico("Pico4Button"));
