@@ -5,10 +5,6 @@ manufacturer = "Lutron"
 version = "1.0.0"
 runtime = "wasm"
 
-# The bridge holds the paired identity — address, client certificate, client key — so every
-# device behind it inherits them rather than carrying its own copy. Pair once; a dimmer added
-# next year reads the same certificate. Unlike the integration-port driver, LEAP works on the
-# standard Smart Bridge as well as the PRO.
 [[proxy]]
 id = 1
 type = "bridge"
@@ -26,12 +22,12 @@ tooltip = "IP of the Caséta Smart Bridge"
 [[property]]
 name = "Client certificate"
 type = "password"
-tooltip = "Issued by the bridge during pairing — do not edit by hand"
+tooltip = "Issued by the bridge during pairing"
 
 [[property]]
 name = "Client key"
 type = "password"
-tooltip = "Issued by the bridge during pairing — do not edit by hand"
+tooltip = "Issued by the bridge during pairing"
 
 [[property]]
 name = "CA certificate"

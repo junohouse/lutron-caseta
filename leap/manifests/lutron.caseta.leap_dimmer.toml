@@ -1,14 +1,11 @@
 [driver]
 id = "lutron.caseta.leap_dimmer"
-name = "Lutron Caséta Dimmer (LEAP)"
+name = "Lutron Caséta Dimmer"
 manufacturer = "Lutron"
 version = "1.0.0"
 runtime = "wasm"
 parent = "lutron.caseta.leap_bridge"
 
-# Found and adopted through the bridge's own setup flow, not on its own — see
-# `lutron.caseta.leap_bridge`. It never carries its own address or certificate; both are the
-# bridge's, inherited.
 [[proxy]]
 id = 1
 type = "light"
