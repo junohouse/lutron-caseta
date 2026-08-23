@@ -6,6 +6,12 @@ version = "1.0.0"
 runtime = "wasm"
 parent = "lutron.caseta.leap_bridge"
 
+# One manifest for the whole Pico family, so this declares the largest of them — and it is a
+# placeholder, not a description. A Pico2Button has two keys and a Pico3ButtonRaiseLower has
+# five, and the bridge is what knows which is in somebody's hand: the driver counts the buttons
+# it found and sends `key_count`/`key_labels` on the candidate, which replaces everything here
+# at adoption. See `pico_keys`. Without that a two-button remote arrived with three keys that
+# were drawn, offered to automations, and impossible to press.
 [[proxy]]
 id = 1
 type = "keypad"
@@ -18,27 +24,10 @@ port = 8081
 tls = true
 keepalive = true
 
-[[property]]
-name = "Button 1 href"
-type = "string"
-tooltip = "LEAP href of the first button — filled in automatically when adopted"
-
-[[property]]
-name = "Button 2 href"
-type = "string"
-tooltip = "LEAP href of the second button — filled in automatically when adopted"
-
-[[property]]
-name = "Button 3 href"
-type = "string"
-tooltip = "LEAP href of the third button — filled in automatically when adopted"
-
-[[property]]
-name = "Button 4 href"
-type = "string"
-tooltip = "LEAP href of the fourth button — filled in automatically when adopted"
-
-[[property]]
-name = "Button 5 href"
-type = "string"
-tooltip = "LEAP href of the fifth button — filled in automatically when adopted"
+# No `[[property]]` blocks for the button hrefs. There were five of them — "Button 1 href"
+# through "Button 5 href", identical but for a number spelled out in words — and they declared
+# nothing: no default, not required, and the properties pane renders the keys a device actually
+# has rather than the ones its manifest names. Every one is written by the bridge's setup flow
+# at adoption, which is the only thing that can know a LEAP href, and read back by
+# `pico_buttons` in the driver. That pair is the contract; a fifth copy of it here was five
+# lines of comment pretending to be schema.

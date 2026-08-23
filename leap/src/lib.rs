@@ -52,7 +52,15 @@ const NET: LocalId = 0;
 /// The bridge's unauthenticated pairing port, and its authenticated one. Lutron's numbers,
 /// which is why they live here and not in the controller.
 const PAIR_PORT: u16 = 8083;
+/// The setup flow opens its own socket, so it needs the port here. The *held* connection is
+/// core's — it dials `[[transport]] port` from the two device manifests, which is the same 8081
+/// written down a second time and cannot be deduplicated from this side. Change one, change all.
 const LEAP_PORT: u16 = 8081;
+
+/// The most buttons any Pico has (a Pico3ButtonRaiseLower). An upper bound for reading the
+/// hrefs off an instance, not a claim about any one remote — what a given Pico actually has is
+/// `pico_keys`, answered per device at adoption.
+const MAX_BUTTONS: usize = 5;
 
 /// How many one-second polls to give someone to walk over and press the button.
 const PAIR_WAIT_SECS: u32 = 30;
@@ -554,7 +562,7 @@ impl CasetaLeap {
                     continue; // no buttons found for it means nothing to subscribe to
                 }
                 let mut props = BTreeMap::new();
-                for (i, b) in buttons.iter().take(5).enumerate() {
+                for (i, b) in buttons.iter().take(MAX_BUTTONS).enumerate() {
                     props.insert(format!("Button {} href", i + 1), json!(b));
                 }
                 out.push(Candidate {
@@ -562,6 +570,7 @@ impl CasetaLeap {
                     kind: "keypad".into(),
                     driver_id: PICO_ID.into(),
                     properties: props,
+                    capabilities: pico_keys(buttons.len().min(MAX_BUTTONS)),
                     verified: "found on bridge".into(),
                     ..Default::default()
                 });
@@ -577,6 +586,29 @@ impl CasetaLeap {
 /// manifest for the ceiling that puts a real name on).
 fn is_pico(device_type: &str) -> bool {
     device_type.starts_with("Pico")
+}
+
+/// How many keys *this* Pico has, for the candidate that is about to be adopted.
+///
+/// The manifest cannot answer it. "Pico" is a family, not a product: a Pico2Button has two keys
+/// and a Pico3ButtonRaiseLower has five, and one manifest covers both because they differ in
+/// nothing else. Declaring the largest meant a two-button remote arrived with three keys that
+/// were drawn in the UI, offered in the automation editor and impossible to press — the same
+/// mistake a four-HDMI declaration makes on a three-port television, and core has the same
+/// answer for it: the driver knows, so the driver says. See `Candidate::capabilities`.
+///
+/// ponytail: numbered labels, because the bridge's ButtonGroups carry hrefs and no names. The
+/// DeviceType does imply Lutron's engraving — On/Favorite/Off/Raise/Lower on a
+/// Pico3ButtonRaiseLower — but the mapping from that to the order the hrefs arrive in is not
+/// something this has been checked against real hardware for, and a key labelled `Off` that
+/// turns the lights on is worse than one labelled `Button 4`. Read `/button/<id>` for the real
+/// engraving if this is worth another round trip.
+fn pico_keys(count: usize) -> BTreeMap<String, Value> {
+    let labels = (1..=count).map(|n| format!("Button {n}")).collect::<Vec<_>>();
+    BTreeMap::from([
+        ("key_count".to_string(), json!(count)),
+        ("key_labels".to_string(), json!(labels.join(","))),
+    ])
 }
 
 /// This Pico's button hrefs, in the order the bridge lists them — physical order, since Lutron
@@ -667,7 +699,7 @@ fn zone(inst: &Instance) -> Option<String> {
 /// anything that is not a Pico, which is how a bridge or a dimmer binding tells `on_event`
 /// and `on_bind` it is neither.
 fn pico_buttons(inst: &Instance) -> Vec<(u64, String)> {
-    (1..=5)
+    (1..=MAX_BUTTONS as u64)
         .filter_map(|n| {
             let href = inst.property(&format!("Button {n} href")).as_str()?;
             (!href.is_empty()).then(|| (n, href.to_string()))
@@ -888,6 +920,32 @@ mod tests {
         assert!(!is_pico("WallDimmer"));
         assert!(!is_pico("Dimmed"));
         assert!(!is_pico(""));
+    }
+
+    /// The bug this replaced: one manifest covers every Pico, so it declared the family's
+    /// largest — five — and a two-button remote arrived with three keys that were drawn in the
+    /// UI, offered in the automation editor, and connected to nothing.
+    #[test]
+    fn a_pico_claims_the_keys_it_has_rather_than_the_manifests_five() {
+        let devices = vec![json!({
+            "href": "/device/8",
+            "Name": "Kitchen Pico",
+            "DeviceType": "Pico2Button",
+        })];
+        let groups = vec![json!({
+            "Parent": { "href": "/device/8" },
+            "Buttons": [{ "href": "/button/9" }, { "href": "/button/10" }],
+        })];
+        let found = CasetaLeap::candidates(&json!({}), false, &devices, &groups);
+        let [pico] = found.as_slice() else { panic!("expected one candidate, got {found:?}") };
+
+        assert_eq!(pico.capabilities["key_count"], json!(2));
+        assert_eq!(pico.capabilities["key_labels"], json!("Button 1,Button 2"));
+        // And the hrefs stop at two as well — a third property would be read back by
+        // `pico_buttons` as a key to subscribe to.
+        assert_eq!(pico.properties["Button 1 href"], json!("/button/9"));
+        assert_eq!(pico.properties["Button 2 href"], json!("/button/10"));
+        assert!(!pico.properties.contains_key("Button 3 href"));
     }
 
     #[test]
