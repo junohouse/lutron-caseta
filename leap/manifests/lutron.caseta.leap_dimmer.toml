@@ -16,8 +16,10 @@ type = "light"
 primary = true
 capabilities = { dimmer = true, supports_ramp = true, ramp_rate_max_ms = 3600000, min_on_level = 1, max_on_level = 100 }
 
-[[transport]]
+[[control]]
+id = 1
 kind = "network"
+name = "LEAP"
 port = 8081
 tls = true
 keepalive = true

@@ -22,8 +22,10 @@ type = "keypad"
 primary = true
 capabilities = { key_count = 5, key_labels = "Button 1,Button 2,Button 3,Button 4,Button 5" }
 
-[[transport]]
+[[control]]
+id = 1
 kind = "network"
+name = "LEAP"
 port = 8081
 tls = true
 keepalive = true
