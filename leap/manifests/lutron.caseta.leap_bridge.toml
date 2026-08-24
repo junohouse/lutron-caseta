@@ -3,6 +3,10 @@ id = "lutron.caseta.leap_bridge"
 name = "Lutron Caséta Smart Bridge"
 manufacturer = "Lutron"
 version = "1.0.0"
+# The names in this package agree on `Lutron` alone — a Pico remote does not say Caséta — and
+# the product is Caséta. `light` because that is what the system is for; the bridge is the wire.
+product = "Lutron Caséta"
+kind = "light"
 runtime = "wasm"
 # What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
 # installer change it from the Logs page; a driver that declares nothing sits at `info` with
