@@ -65,6 +65,16 @@ const MAX_BUTTONS: usize = 5;
 /// How many one-second polls to give someone to walk over and press the button.
 const PAIR_WAIT_SECS: u32 = 30;
 
+/// How many more reads to give the bridge for an answer that has not arrived yet.
+///
+/// A read returns as soon as the socket goes quiet for a moment, and a Caséta bridge
+/// volunteers a `SubscribeResponse` or two the instant a connection opens — so the first read
+/// after a `ReadRequest` is routinely all acknowledgement and no answer, with the answer
+/// arriving a beat later. `leap_answer` skips acknowledgements within one read; this is the
+/// same thing across reads. Without it a bridge with three devices behind it listed none, and
+/// the flow said there was nothing to add.
+const READ_RETRIES: u32 = 5;
+
 // ---------------------------------------------------------------------------------------
 // LEAP framing
 //
@@ -440,11 +450,38 @@ impl CasetaLeap {
                 send: leap_line(&body),
                 send_bytes: Vec::new(),
                 read_ms: 6000,
-                close: true,
+                // Held open: the answer may need another read (see `READ_RETRIES`), and the
+                // `/buttongroup` read that follows goes down this same connection. Core closes
+                // whatever is still open when the flow ends, so there is nothing to reap.
+                close: false,
                 note: "list".into(),
             },
-            state.clone(),
+            with_fields(state, &[("tries", "0")]),
         )
+    }
+
+    /// Listen again on the connection that was just asked something.
+    ///
+    /// `None` once the bridge has been given [`READ_RETRIES`] chances — at that point it is not
+    /// answering, which is a failure to report rather than an empty list to draw.
+    fn read_again(state: &Value, input: &Args, stage: &str) -> Option<(SetupStep, Value)> {
+        let tries: u32 = field(state, "tries").parse().unwrap_or(0);
+        if tries >= READ_RETRIES {
+            return None;
+        }
+        Some((
+            SetupStep::Session {
+                session: input.get("session").and_then(Value::as_u64).map(|v| v as u32),
+                open: None,
+                accept: None,
+                send: String::new(),
+                send_bytes: Vec::new(),
+                read_ms: 2000,
+                close: false,
+                note: "list".into(),
+            },
+            with_fields(state, &[("stage", stage), ("tries", &(tries + 1).to_string())]),
+        ))
     }
 
     /// Turn a `/device` reply into candidates — or, if a Pico is behind this bridge, into one
@@ -455,31 +492,51 @@ impl CasetaLeap {
     /// other reply on this connection — `SetupStep::Session` never hands back the latter, only
     /// `SetupStep::Fetch` (an HTTP call this driver does not make) does.
     fn handle_device_list(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
+        if let Some(err) = input.get("error").and_then(Value::as_str) {
+            return (
+                SetupStep::Failed { reason: format!("could not read the bridge's device list: {err}") },
+                Value::Null,
+            );
+        }
         let response = leap_answer(input.get("received").and_then(Value::as_str).unwrap_or(""));
-        let devices = response
-            .pointer("/Body/Devices")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        // Whether this was the answer at all, rather than how much of one it was: a bridge
+        // always lists itself, so an absent `Devices` means the reply is still on its way and
+        // an empty one would be a bridge that has genuinely forgotten itself.
+        let Some(devices) = response.pointer("/Body/Devices").and_then(Value::as_array).cloned()
+        else {
+            return Self::read_again(state, input, "listing").unwrap_or((
+                SetupStep::Failed { reason: "the bridge did not answer with its device list".into() },
+                Value::Null,
+            ));
+        };
 
         let any_pico = devices
             .iter()
             .any(|d| is_pico(d.get("DeviceType").and_then(Value::as_str).unwrap_or("")));
         if any_pico {
-            return Self::request_button_groups(state, include_bridge, devices);
+            return Self::request_button_groups(state, input, include_bridge, devices);
         }
         (SetupStep::done(Self::candidates(state, include_bridge, &devices, &[])), Value::Null)
     }
 
     /// One more read, made only when something found in `/device` needs it — most bridges have
     /// no Pico behind them and never pay for this round trip.
-    fn request_button_groups(state: &Value, include_bridge: bool, devices: Vec<Value>) -> (SetupStep, Value) {
-        let (address, cert, key) = Self::bridge_identity(state);
+    fn request_button_groups(
+        state: &Value,
+        input: &Args,
+        include_bridge: bool,
+        devices: Vec<Value>,
+    ) -> (SetupStep, Value) {
         let body = json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": "/buttongroup" } });
 
         let mut next = with_fields(
             state,
-            &[("stage", "listing_buttons"), ("include_bridge", if include_bridge { "true" } else { "false" })],
+            &[
+                ("stage", "listing_buttons"),
+                ("include_bridge", if include_bridge { "true" } else { "false" }),
+                // A fresh budget for the second question, not what the first one had left.
+                ("tries", "0"),
+            ],
         );
         if let Value::Object(ref mut m) = next {
             // Carried across this round trip as plain JSON, the same as everything else in
@@ -488,13 +545,16 @@ impl CasetaLeap {
         }
         (
             SetupStep::Session {
-                session: None,
-                open: Some(Connect::mutual_tls(address, LEAP_PORT, cert, key)),
+                // Down the connection that just answered `/device` rather than a second
+                // handshake: the bridge only volunteers its acknowledgements once per
+                // connection, so reusing this one is also one fewer round of them to read past.
+                session: input.get("session").and_then(Value::as_u64).map(|v| v as u32),
+                open: None,
                 accept: None,
                 send: leap_line(&body),
                 send_bytes: Vec::new(),
                 read_ms: 6000,
-                close: true,
+                close: false,
                 note: "list".into(),
             },
             next,
@@ -502,12 +562,20 @@ impl CasetaLeap {
     }
 
     fn handle_button_groups(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
+        if let Some(err) = input.get("error").and_then(Value::as_str) {
+            return (
+                SetupStep::Failed { reason: format!("could not read the bridge's buttons: {err}") },
+                Value::Null,
+            );
+        }
         let response = leap_answer(input.get("received").and_then(Value::as_str).unwrap_or(""));
-        let groups = response
-            .pointer("/Body/ButtonGroups")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let Some(groups) = response.pointer("/Body/ButtonGroups").and_then(Value::as_array).cloned()
+        else {
+            return Self::read_again(state, input, "listing_buttons").unwrap_or((
+                SetupStep::Failed { reason: "the bridge did not answer with its button groups".into() },
+                Value::Null,
+            ));
+        };
         let devices: Vec<Value> = state.get("devices_json").and_then(Value::as_array).cloned().unwrap_or_default();
         (SetupStep::done(Self::candidates(state, include_bridge, &devices, &groups)), Value::Null)
     }
@@ -521,7 +589,7 @@ impl CasetaLeap {
             props.insert("Client key".into(), json!(field(state, "key_pem")));
             props.insert("CA certificate".into(), json!(field(state, "ca_pem")));
             out.push(Candidate {
-                label: format!("Caséta Smart Bridge ({})", field(state, "address")),
+                label: "Caséta Smart Bridge".into(),
                 kind: "bridge".into(),
                 driver_id: BRIDGE_ID.into(),
                 properties: props,
@@ -890,6 +958,47 @@ mod tests {
         assert!(leap_answer("{\"CommuniqueType\":\"SubscribeResponse\"}\n").is_null());
         // A half-written line is normal when a read window closes mid-message.
         assert!(leap_answer("{\"Communiqu").is_null());
+    }
+
+    /// The bug this pins: core's read returns as soon as the socket goes quiet for a moment,
+    /// and a real bridge's first reply to `/device` is nothing but the acknowledgements it
+    /// volunteers on connect. Concluding "no devices" from that listed none of the three
+    /// behind a real bridge and told somebody there was nothing to add.
+    #[test]
+    fn an_answer_that_has_not_arrived_yet_is_read_again_rather_than_called_empty() {
+        let state = json!({ "browse": true, "stage": "listing", "tries": "0" });
+        let mut only_noise = Args::new();
+        only_noise.insert("session".into(), json!(7));
+        only_noise.insert(
+            "received".into(),
+            json!("{\"CommuniqueType\":\"SubscribeResponse\",\"Header\":{\"StatusCode\":\"204 NoContent\"}}\n"),
+        );
+
+        let (step, next) = CasetaLeap::handle_device_list(&state, &only_noise, false);
+        match step {
+            SetupStep::Session { session, open, send, .. } => {
+                assert_eq!(session, Some(7), "the same connection, not a second handshake");
+                assert!(open.is_none() && send.is_empty(), "listening again, not asking again");
+            }
+            other => panic!("expected another read, got {other:?}"),
+        }
+        assert_eq!(next["tries"], "1");
+
+        // The bridge gets a bounded number of chances, and then this is a failure to report
+        // rather than an empty list to draw.
+        let spent = json!({ "browse": true, "stage": "listing", "tries": READ_RETRIES.to_string() });
+        assert!(matches!(
+            CasetaLeap::handle_device_list(&spent, &only_noise, false).0,
+            SetupStep::Failed { .. }
+        ));
+
+        // And a connection that could not be opened is that failure, not an empty house.
+        let mut refused = Args::new();
+        refused.insert("error".into(), json!("connection refused"));
+        assert!(matches!(
+            CasetaLeap::handle_device_list(&state, &refused, false).0,
+            SetupStep::Failed { .. }
+        ));
     }
 
     #[test]
