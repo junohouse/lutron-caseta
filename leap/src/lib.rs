@@ -604,7 +604,7 @@ impl CasetaLeap {
         const DIMMABLE: &[&str] = &["WallDimmer", "PlugInDimmer", "InLineDimmer", "Dimmed"];
         for d in devices {
             let kind = d.get("DeviceType").and_then(Value::as_str).unwrap_or("");
-            let name = d.get("Name").and_then(Value::as_str).unwrap_or("Caséta device").to_string();
+            let name = caseta_name(d);
 
             if DIMMABLE.contains(&kind) {
                 let Some(zone) = d.pointer("/LocalZones/0/href").and_then(Value::as_str) else {
@@ -647,6 +647,28 @@ impl CasetaLeap {
 
         out
     }
+}
+
+/// What the Caséta app calls this device.
+///
+/// `Name` alone is the leaf — a Pico in the kitchen is called `Pico`, and so is the one in the
+/// hall. `FullyQualifiedName` is the same name with the area in front of it, which is what the
+/// app shows and what somebody adopting one recognises: `Kitchen Pico`. Falls back to `Name`
+/// for anything the bridge files outside an area, such as the bridge itself.
+fn caseta_name(device: &Value) -> String {
+    let parts: Vec<&str> = device
+        .get("FullyQualifiedName")
+        .and_then(Value::as_array)
+        .map(|parts| parts.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if !parts.is_empty() {
+        return parts.join(" ");
+    }
+    device
+        .get("Name")
+        .and_then(Value::as_str)
+        .unwrap_or("Caséta device")
+        .to_string()
 }
 
 /// Any Pico remote — `Pico2Button`, `Pico3ButtonRaiseLower`, `Pico4Button` and the rest all
