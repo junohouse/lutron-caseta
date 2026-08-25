@@ -12,10 +12,12 @@ parent = "lutron.caseta.leap_bridge"
 
 # One manifest for the whole Pico family, so this declares the largest of them — and it is a
 # placeholder, not a description. A Pico2Button has two keys and a Pico3ButtonRaiseLower has
-# five, and the bridge is what knows which is in somebody's hand: the driver counts the buttons
-# it found and sends `key_count`/`key_labels` on the candidate, which replaces everything here
-# at adoption. See `pico_keys`. Without that a two-button remote arrived with three keys that
-# were drawn, offered to automations, and impossible to press.
+# five, and neither this file nor the bridge is what knows which: the bridge lists five buttons
+# under a two-key remote and calls each of them `Button N`, so the *model* is the only thing
+# that says which numbers are real and what they are engraved with. The driver holds that table
+# and sends `key_count`/`key_labels` on the candidate, which replaces everything here at
+# adoption. See `PICO_KEYS` and `pico_keys_of`. Without it a two-button remote arrived with five
+# keys that were drawn, offered to automations, and impossible to press.
 [[proxy]]
 id = 1
 type = "keypad"

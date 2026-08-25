@@ -15,7 +15,7 @@
 //!   bridge to push confirmation that its button was physically pressed, then submit a CSR
 //!   and get back a certificate signed for this installation specifically.
 //! - Port 8081, mutual TLS with that certificate: everything else. A `ReadRequest` for
-//!   `/device` lists what is paired, `/buttongroup` lists a Pico's buttons; a
+//!   `/device` lists what is paired, `/button` lists every key on every remote; a
 //!   `SubscribeRequest` on a zone's `/status` or a button's `/status/event` is how a press —
 //!   on the wall or on a remote — reaches us without polling.
 //!
@@ -59,8 +59,55 @@ const LEAP_PORT: u16 = 8081;
 
 /// The most buttons any Pico has (a Pico3ButtonRaiseLower). An upper bound for reading the
 /// hrefs off an instance, not a claim about any one remote — what a given Pico actually has is
-/// `pico_keys`, answered per device at adoption.
+/// `pico_keys_of`, answered per device at adoption.
 const MAX_BUTTONS: usize = 5;
+
+/// What each key on a Pico is, by model, keyed on `ButtonNumber`.
+///
+/// The bridge does not say, and cannot be made to. Every key it lists is called `Button 1`
+/// through `Button 5` whatever is in somebody's hand — confirmed on a PJ-3BRL, whose five
+/// buttons come back with exactly those names and no engraving — and it lists numbers that do
+/// not exist on the remote: a `Pico2Button` has two keys and is still filed under a group of
+/// five. So which numbers are real, and what they are called, is a property of the model and
+/// nothing else. This is the table `pylutron-caseta` and Home Assistant's `lutron_caseta`
+/// integration both keep, and this one is transcribed from the latter's
+/// `DEVICE_TYPE_SUBTYPE_MAP_TO_LEAP`, which is the same numbers.
+///
+/// `FourGroupRemote` is deliberately absent: it has twenty-five buttons, five times what a
+/// keypad proxy here can carry, so it falls through to the numbered case and gets the first
+/// five rather than a name for the wrong key.
+///
+/// Order is `ButtonNumber` order, not the order they sit on the remote — a 3BRL reads On,
+/// Favorite, Off, Raise, Lower, while your thumb finds On, Raise, Favorite, Lower, Off. The
+/// keys are named now, so the list is a stable identity rather than a picture of the remote.
+const PICO_KEYS: &[(&str, &[(u64, &str)])] = &[
+    ("Pico2Button", &[(0, "On"), (2, "Off")]),
+    ("PaddleSwitchPico", &[(0, "On"), (2, "Off")]),
+    ("Pico2ButtonRaiseLower", &[(0, "On"), (2, "Off"), (3, "Raise"), (4, "Lower")]),
+    ("Pico3Button", &[(0, "On"), (1, "Favorite"), (2, "Off")]),
+    (
+        "Pico3ButtonRaiseLower",
+        &[(0, "On"), (1, "Favorite"), (2, "Off"), (3, "Raise"), (4, "Lower")],
+    ),
+    (
+        "Pico4Button",
+        &[(1, "Button 1"), (2, "Button 2"), (3, "Button 3"), (4, "Button 4")],
+    ),
+    (
+        "Pico4ButtonScene",
+        &[(1, "Button 1"), (2, "Button 2"), (3, "Button 3"), (4, "Off")],
+    ),
+    ("Pico4ButtonZone", &[(1, "On"), (2, "Raise"), (3, "Lower"), (4, "Off")]),
+    (
+        "Pico4Button2Group",
+        &[
+            (1, "Group 1 Button 1"),
+            (2, "Group 1 Button 2"),
+            (3, "Group 2 Button 1"),
+            (4, "Group 2 Button 2"),
+        ],
+    ),
+];
 
 /// How many one-second polls to give someone to walk over and press the button.
 const PAIR_WAIT_SECS: u32 = 30;
@@ -485,8 +532,8 @@ impl CasetaLeap {
     }
 
     /// Turn a `/device` reply into candidates — or, if a Pico is behind this bridge, into one
-    /// more read first. A button lives in `/buttongroup`, a separate collection `/device`
-    /// only points at, so a Pico cannot be offered from this reply alone the way a dimmer can.
+    /// more read first. A key lives in `/button`, a separate collection `/device` only points
+    /// at, so a Pico cannot be offered from this reply alone the way a dimmer can.
     ///
     /// Reads `received`/`leap_answer` rather than a pre-parsed `response`, the same as every
     /// other reply on this connection — `SetupStep::Session` never hands back the latter, only
@@ -514,20 +561,28 @@ impl CasetaLeap {
             .iter()
             .any(|d| is_pico(d.get("DeviceType").and_then(Value::as_str).unwrap_or("")));
         if any_pico {
-            return Self::request_button_groups(state, input, include_bridge, devices);
+            return Self::request_buttons(state, input, include_bridge, devices);
         }
         (SetupStep::done(Self::candidates(state, include_bridge, &devices, &[])), Value::Null)
     }
 
     /// One more read, made only when something found in `/device` needs it — most bridges have
     /// no Pico behind them and never pay for this round trip.
-    fn request_button_groups(
+    /// Every key on every remote behind this bridge, in one read.
+    ///
+    /// `/button` rather than `/buttongroup`, which is what this asked for until the button a key
+    /// *is* turned out to matter: a group lists hrefs and nothing else, so the only way to tell
+    /// which key an href was involved assuming its position in that list was its `ButtonNumber`.
+    /// It is not — see `PICO_KEYS` — and on a remote with fewer keys than the group has entries
+    /// that assumption names every one of them wrong. A button carries its own number, and its
+    /// parent group, which is everything `/buttongroup` was being read for.
+    fn request_buttons(
         state: &Value,
         input: &Args,
         include_bridge: bool,
         devices: Vec<Value>,
     ) -> (SetupStep, Value) {
-        let body = json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": "/buttongroup" } });
+        let body = json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": "/button" } });
 
         let mut next = with_fields(
             state,
@@ -561,7 +616,7 @@ impl CasetaLeap {
         )
     }
 
-    fn handle_button_groups(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
+    fn handle_buttons(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
         if let Some(err) = input.get("error").and_then(Value::as_str) {
             return (
                 SetupStep::Failed { reason: format!("could not read the bridge's buttons: {err}") },
@@ -569,18 +624,18 @@ impl CasetaLeap {
             );
         }
         let response = leap_answer(input.get("received").and_then(Value::as_str).unwrap_or(""));
-        let Some(groups) = response.pointer("/Body/ButtonGroups").and_then(Value::as_array).cloned()
+        let Some(buttons) = response.pointer("/Body/Buttons").and_then(Value::as_array).cloned()
         else {
             return Self::read_again(state, input, "listing_buttons").unwrap_or((
-                SetupStep::Failed { reason: "the bridge did not answer with its button groups".into() },
+                SetupStep::Failed { reason: "the bridge did not answer with its buttons".into() },
                 Value::Null,
             ));
         };
         let devices: Vec<Value> = state.get("devices_json").and_then(Value::as_array).cloned().unwrap_or_default();
-        (SetupStep::done(Self::candidates(state, include_bridge, &devices, &groups)), Value::Null)
+        (SetupStep::done(Self::candidates(state, include_bridge, &devices, &buttons)), Value::Null)
     }
 
-    fn candidates(state: &Value, include_bridge: bool, devices: &[Value], button_groups: &[Value]) -> Vec<Candidate> {
+    fn candidates(state: &Value, include_bridge: bool, devices: &[Value], buttons: &[Value]) -> Vec<Candidate> {
         let mut out = Vec::new();
         if include_bridge {
             let mut props = BTreeMap::new();
@@ -624,21 +679,21 @@ impl CasetaLeap {
             }
 
             if is_pico(kind) {
-                let Some(href) = d.get("href").and_then(Value::as_str) else { continue };
-                let buttons = pico_button_hrefs(href, button_groups);
-                if buttons.is_empty() {
+                let keys = pico_keys_of(d, buttons);
+                if keys.is_empty() {
                     continue; // no buttons found for it means nothing to subscribe to
                 }
                 let mut props = BTreeMap::new();
-                for (i, b) in buttons.iter().take(MAX_BUTTONS).enumerate() {
-                    props.insert(format!("Button {} href", i + 1), json!(b));
+                for (i, (href, _)) in keys.iter().enumerate() {
+                    props.insert(format!("Button {} href", i + 1), json!(href));
                 }
+                let labels: Vec<&str> = keys.iter().map(|(_, label)| label.as_str()).collect();
                 out.push(Candidate {
                     label: name,
                     kind: "keypad".into(),
                     driver_id: PICO_ID.into(),
                     properties: props,
-                    capabilities: pico_keys(buttons.len().min(MAX_BUTTONS)),
+                    capabilities: pico_capabilities(&labels),
                     verified: "found on bridge".into(),
                     ..Default::default()
                 });
@@ -678,38 +733,78 @@ fn is_pico(device_type: &str) -> bool {
     device_type.starts_with("Pico")
 }
 
-/// How many keys *this* Pico has, for the candidate that is about to be adopted.
+/// This Pico's keys: each one's href and what it is called, in `ButtonNumber` order.
 ///
 /// The manifest cannot answer it. "Pico" is a family, not a product: a Pico2Button has two keys
 /// and a Pico3ButtonRaiseLower has five, and one manifest covers both because they differ in
-/// nothing else. Declaring the largest meant a two-button remote arrived with three keys that
+/// nothing else. Declaring the largest meant a two-button remote arrived with five keys that
 /// were drawn in the UI, offered in the automation editor and impossible to press — the same
 /// mistake a four-HDMI declaration makes on a three-port television, and core has the same
 /// answer for it: the driver knows, so the driver says. See `Candidate::capabilities`.
 ///
-/// ponytail: numbered labels, because the bridge's ButtonGroups carry hrefs and no names. The
-/// DeviceType does imply Lutron's engraving — On/Favorite/Off/Raise/Lower on a
-/// Pico3ButtonRaiseLower — but the mapping from that to the order the hrefs arrive in is not
-/// something this has been checked against real hardware for, and a key labelled `Off` that
-/// turns the lights on is worse than one labelled `Button 4`. Read `/button/<id>` for the real
-/// engraving if this is worth another round trip.
-fn pico_keys(count: usize) -> BTreeMap<String, Value> {
-    let labels = (1..=count).map(|n| format!("Button {n}")).collect::<Vec<_>>();
-    BTreeMap::from([
-        ("key_count".to_string(), json!(count)),
-        ("key_labels".to_string(), json!(labels.join(","))),
-    ])
+/// What the driver knows is `PICO_KEYS`, because the bridge does not: it lists five buttons
+/// under a remote that has two, names every one of them `Button N`, and leaves the model as the
+/// only thing that says which is which. Counting what came back is what claimed five keys on a
+/// four-key remote. A model that is not in the table keeps that behaviour deliberately — every
+/// key the bridge listed, numbered — since `Button 3` that presses beats `Off` that does not.
+fn pico_keys_of(device: &Value, buttons: &[Value]) -> Vec<(String, String)> {
+    let groups: Vec<&str> = device
+        .get("ButtonGroups")
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|group| group.get("href").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // This remote's keys, by the number the bridge gave each — the identity a model's table is
+    // written against. Sorted, because the numbered fallback below reads position as order.
+    let mut mine: Vec<(u64, &str)> = buttons
+        .iter()
+        .filter(|button| {
+            button
+                .pointer("/Parent/href")
+                .and_then(Value::as_str)
+                .is_some_and(|parent| groups.contains(&parent))
+        })
+        .filter_map(|button| {
+            Some((
+                button.get("ButtonNumber").and_then(Value::as_u64)?,
+                button.get("href").and_then(Value::as_str)?,
+            ))
+        })
+        .collect();
+    mine.sort_by_key(|(number, _)| *number);
+
+    let model = device.get("DeviceType").and_then(Value::as_str).unwrap_or("");
+    match PICO_KEYS.iter().find(|(known, _)| *known == model) {
+        Some((_, keys)) => keys
+            .iter()
+            .take(MAX_BUTTONS)
+            // A number the table names and this remote did not report is a key that is not
+            // there. Skipped rather than counted, which is the whole point of the table.
+            .filter_map(|(number, label)| {
+                let href = mine.iter().find(|(theirs, _)| theirs == number)?.1;
+                Some((href.to_string(), (*label).to_string()))
+            })
+            .collect(),
+        None => mine
+            .iter()
+            .take(MAX_BUTTONS)
+            .enumerate()
+            .map(|(i, (_, href))| (href.to_string(), format!("Button {}", i + 1)))
+            .collect(),
+    }
 }
 
-/// This Pico's button hrefs, in the order the bridge lists them — physical order, since Lutron
-/// assigns them at commissioning top to bottom.
-fn pico_button_hrefs<'a>(device_href: &str, button_groups: &'a [Value]) -> Vec<&'a str> {
-    button_groups
-        .iter()
-        .filter(|g| g.pointer("/Parent/href").and_then(Value::as_str) == Some(device_href))
-        .flat_map(|g| g.pointer("/Buttons").and_then(Value::as_array).into_iter().flatten())
-        .filter_map(|b| b.get("href").and_then(Value::as_str))
-        .collect()
+/// What a Pico's keypad proxy claims, for the candidate that is about to be adopted.
+fn pico_capabilities(labels: &[&str]) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("key_count".to_string(), json!(labels.len())),
+        ("key_labels".to_string(), json!(labels.join(","))),
+    ])
 }
 
 impl DriverModule for CasetaLeap {
@@ -725,7 +820,7 @@ impl DriverModule for CasetaLeap {
         if state.get("browse").and_then(Value::as_bool) == Some(true) {
             return match field(state, "stage").as_str() {
                 "listing" => Self::handle_device_list(state, input, false),
-                "listing_buttons" => Self::handle_button_groups(state, input, false),
+                "listing_buttons" => Self::handle_buttons(state, input, false),
                 _ => Self::request_device_list(&with_fields(state, &[("stage", "listing")])),
             };
         }
@@ -738,7 +833,7 @@ impl DriverModule for CasetaLeap {
             "pairing" => Self::await_button_press(state, input),
             "pair_sent" => Self::handle_pair_response(state, input),
             "listing" => Self::handle_device_list(state, input, true),
-            "listing_buttons" => Self::handle_button_groups(state, input, true),
+            "listing_buttons" => Self::handle_buttons(state, input, true),
             _ => Self::ask_address(state, input),
         }
     }
@@ -1056,52 +1151,96 @@ mod tests {
     /// The bug this replaced: one manifest covers every Pico, so it declared the family's
     /// largest — five — and a two-button remote arrived with three keys that were drawn in the
     /// UI, offered in the automation editor, and connected to nothing.
+    /// The bug this pins: the bridge files a two-key remote under a group of five buttons,
+    /// numbered 0 to 4, and calls every one of them `Button N`. Counting what came back put
+    /// five keys on a remote with two — drawn in the UI, offered to automations, impossible to
+    /// press. Only the model says which numbers are real, and what they are called.
     #[test]
-    fn a_pico_claims_the_keys_it_has_rather_than_the_manifests_five() {
+    fn a_pico_claims_the_keys_its_model_has_rather_than_every_number_the_bridge_listed() {
         let devices = vec![json!({
             "href": "/device/8",
-            "Name": "Kitchen Pico",
+            "Name": "Pico",
+            "FullyQualifiedName": ["Kitchen", "Pico"],
             "DeviceType": "Pico2Button",
+            "ButtonGroups": [{ "href": "/buttongroup/5" }],
         })];
-        let groups = vec![json!({
-            "Parent": { "href": "/device/8" },
-            "Buttons": [{ "href": "/button/9" }, { "href": "/button/10" }],
-        })];
-        let found = CasetaLeap::candidates(&json!({}), false, &devices, &groups);
+        let buttons = (0..5)
+            .map(|n| {
+                json!({
+                    "href": format!("/button/{}", 9 + n),
+                    "ButtonNumber": n,
+                    "Name": format!("Button {}", n + 1),
+                    "Parent": { "href": "/buttongroup/5" },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let found = CasetaLeap::candidates(&json!({}), false, &devices, &buttons);
         let [pico] = found.as_slice() else { panic!("expected one candidate, got {found:?}") };
 
+        assert_eq!(pico.label, "Kitchen Pico", "the name the Caséta app shows");
         assert_eq!(pico.capabilities["key_count"], json!(2));
-        assert_eq!(pico.capabilities["key_labels"], json!("Button 1,Button 2"));
-        // And the hrefs stop at two as well — a third property would be read back by
-        // `pico_buttons` as a key to subscribe to.
+        assert_eq!(pico.capabilities["key_labels"], json!("On,Off"));
+        // On is button 0 and Off is button *2* — not the first two the bridge listed, which is
+        // what makes this a table rather than a count.
         assert_eq!(pico.properties["Button 1 href"], json!("/button/9"));
-        assert_eq!(pico.properties["Button 2 href"], json!("/button/10"));
+        assert_eq!(pico.properties["Button 2 href"], json!("/button/11"));
         assert!(!pico.properties.contains_key("Button 3 href"));
     }
 
+    /// The one model there is real hardware for here: a PJ-3BRL, five keys, whose buttons come
+    /// back numbered 0 to 4 with no engraving on any of them.
     #[test]
-    fn a_picos_buttons_come_from_the_group_that_belongs_to_it_in_bridge_order() {
-        let groups = vec![
-            json!({
-                "Parent": { "href": "/device/9" },
-                "Buttons": [{ "href": "/button/50" }, { "href": "/button/51" }],
-            }),
-            json!({
-                "Parent": { "href": "/device/8" },
-                "Buttons": [
-                    { "href": "/button/9" },
-                    { "href": "/button/10" },
-                    { "href": "/button/11" },
-                ],
-            }),
+    fn a_three_button_raise_lower_pico_is_named_the_way_lutron_engraves_it() {
+        let devices = vec![json!({
+            "href": "/device/6",
+            "Name": "Pico",
+            "FullyQualifiedName": ["Kitchen", "Pico"],
+            "DeviceType": "Pico3ButtonRaiseLower",
+            "ButtonGroups": [{ "href": "/buttongroup/5" }],
+        })];
+        let buttons = (0..5)
+            .map(|n| {
+                json!({
+                    "href": format!("/button/{}", 116 + n),
+                    "ButtonNumber": n,
+                    "Parent": { "href": "/buttongroup/5" },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let found = CasetaLeap::candidates(&json!({}), false, &devices, &buttons);
+        let [pico] = found.as_slice() else { panic!("expected one candidate, got {found:?}") };
+        assert_eq!(pico.capabilities["key_count"], json!(5));
+        assert_eq!(pico.capabilities["key_labels"], json!("On,Favorite,Off,Raise,Lower"));
+        assert_eq!(pico.properties["Button 5 href"], json!("/button/120"));
+    }
+
+    #[test]
+    fn a_picos_keys_are_its_own_and_a_model_nobody_wrote_down_still_gets_keys() {
+        let device = json!({
+            "DeviceType": "PicoSomethingUnheardOf",
+            "ButtonGroups": [{ "href": "/buttongroup/8" }],
+        });
+        let buttons = vec![
+            // Somebody else's remote, on the same bridge-wide list.
+            json!({ "href": "/button/50", "ButtonNumber": 0, "Parent": { "href": "/buttongroup/9" } }),
+            json!({ "href": "/button/10", "ButtonNumber": 1, "Parent": { "href": "/buttongroup/8" } }),
+            json!({ "href": "/button/9", "ButtonNumber": 0, "Parent": { "href": "/buttongroup/8" } }),
         ];
+
         assert_eq!(
-            pico_button_hrefs("/device/8", &groups),
-            vec!["/button/9", "/button/10", "/button/11"]
+            pico_keys_of(&device, &buttons),
+            vec![
+                ("/button/9".to_string(), "Button 1".to_string()),
+                ("/button/10".to_string(), "Button 2".to_string()),
+            ],
+            "an unknown model keeps every key the bridge listed, in ButtonNumber order",
         );
+
         // A device with no button group at all — an occupancy sensor, say — gets nothing to
         // subscribe to rather than a button that belongs to somebody else's remote.
-        assert!(pico_button_hrefs("/device/404", &groups).is_empty());
+        assert!(pico_keys_of(&json!({ "DeviceType": "Pico2Button" }), &buttons).is_empty());
     }
 
     #[test]
