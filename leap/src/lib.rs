@@ -45,6 +45,86 @@ use std::collections::BTreeMap;
 const BRIDGE_ID: &str = "lutron.caseta.leap_bridge";
 const DIMMER_ID: &str = "lutron.caseta.leap_dimmer";
 const PICO_ID: &str = "lutron.caseta.leap_pico";
+const SWITCH_ID: &str = "lutron.caseta.leap_switch";
+const FAN_ID: &str = "lutron.caseta.leap_fan";
+const SHADE_ID: &str = "lutron.caseta.leap_shade";
+
+/// What a zone behind this bridge turns out to be.
+///
+/// Every one of them is a `/zone` with a level, and that is exactly why this exists: the wire
+/// looks the same for a dimmer, a switch, a fan and a shade, while the proxy each one presents
+/// and the notification each one owes are different. Written at adoption under `Kind` and read
+/// back on every command and every status — the same trick the Pico's button hrefs use, and for
+/// the same reason: `Instance` carries properties and nothing else, so anything the driver needs
+/// to know about itself has to be one.
+///
+/// A device adopted before this existed has no `Kind` and reads as `Light`, which is what it
+/// was — nothing rewrites a saved house.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Light,
+    Switch,
+    Fan,
+    Shade,
+}
+
+impl Kind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Kind::Light => "light",
+            Kind::Switch => "switch",
+            Kind::Fan => "fan",
+            Kind::Shade => "shade",
+        }
+    }
+
+    fn of(inst: &Instance) -> Kind {
+        match inst.property("Kind").as_str().unwrap_or("") {
+            "switch" => Kind::Switch,
+            "fan" => Kind::Fan,
+            "shade" => Kind::Shade,
+            _ => Kind::Light,
+        }
+    }
+}
+
+/// Which LEAP `DeviceType`s are which, transcribed from `pylutron-caseta`'s own
+/// `_LEAP_DEVICE_TYPES`. Not guessed and not shortened: the list is long because Lutron has
+/// shipped a lot of hardware, and a type missing from it is a device that silently cannot be
+/// added rather than one that behaves oddly.
+///
+/// `sensor` is deliberately absent. Everything in that group is a keypad or a remote, which
+/// this driver already reaches through `is_pico` and the button collection — they are not
+/// zones and have no level to read.
+const DIMMABLE: &[&str] = &[
+    "WallDimmer", "PlugInDimmer", "InLineDimmer", "SunnataDimmer", "TempInWallPaddleDimmer",
+    "WallDimmerWithPreset", "Dimmed", "SpectrumTune", "DivaSmartDimmer", "WhiteTune",
+    "PowPak0-10V", "ColorTune",
+];
+const SWITCHED: &[&str] = &[
+    "WallSwitch", "OutdoorPlugInSwitch", "PlugInSwitch", "InLineSwitch", "PowPakSwitch",
+    "SunnataSwitch", "TempInWallPaddleSwitch", "Switched", "KeypadLED", "DivaSmartSwitch",
+];
+const FANS: &[&str] = &["CasetaFanSpeedController", "MaestroFanSpeedController", "FanSpeed"];
+const COVERS: &[&str] = &[
+    "SerenaHoneycombShade", "SerenaRollerShade", "TriathlonHoneycombShade",
+    "TriathlonEssentialsRollerShade", "TriathlonRollerShade", "TriathlonTiltOnlyWoodBlind",
+    "QsWirelessShade", "QsWirelessHorizontalSheerBlind", "QsWirelessWoodBlind", "RightDrawDrape",
+    "Shade", "Tilt", "SerenaTiltOnlyWoodBlind", "PalladiomWireFreeShade",
+    "SerenaEssentialsRollerShade", "OpenCloseStop",
+];
+
+/// The speeds a Caséta fan controller has, in the house's words and on the wire.
+///
+/// Slowest first, matching the `speeds` capability the manifest declares. The translation lives
+/// here because a vendor's spelling is the driver's business: a rule written in this house says
+/// `medium_high`, and only this line knows LEAP calls it `MediumHigh`.
+const FAN_SPEEDS: &[(&str, &str)] = &[
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("medium_high", "MediumHigh"),
+    ("high", "High"),
+];
 
 /// `control: 0` is the driver's own network transport — core owns the socket.
 const NET: LocalId = 0;
@@ -653,27 +733,48 @@ impl CasetaLeap {
             });
         }
 
-        // ponytail: dimmers and Picos only. Switches, RA2-style wired keypads, and occupancy
-        // sensors are real LEAP device types too — add a DeviceType arm here plus a manifest
-        // for each when one is needed.
-        const DIMMABLE: &[&str] = &["WallDimmer", "PlugInDimmer", "InLineDimmer", "Dimmed"];
+        // ponytail: occupancy sensors are the one LEAP group still missing. They are not zones
+        // — they arrive through `/occupancygroup`, which is a different collection and a
+        // different subscription — so they want their own read rather than an arm here.
         for d in devices {
             let kind = d.get("DeviceType").and_then(Value::as_str).unwrap_or("");
             let (name, room) = caseta_name(d);
 
-            if DIMMABLE.contains(&kind) {
+            // Every zone behind the bridge, whatever it turns out to drive. They are told apart
+            // only by `DeviceType` — the zone itself looks identical for all of them — so the
+            // answer is written down as `Kind` and read back on every command afterwards.
+            let zoned = if DIMMABLE.contains(&kind) {
+                Some((Kind::Light, DIMMER_ID, "light"))
+            } else if SWITCHED.contains(&kind) {
+                Some((Kind::Switch, SWITCH_ID, "switch"))
+            } else if FANS.contains(&kind) {
+                Some((Kind::Fan, FAN_ID, "fan"))
+            } else if COVERS.contains(&kind) {
+                Some((Kind::Shade, SHADE_ID, "blind"))
+            } else {
+                None
+            };
+            if let Some((which, driver_id, proxy)) = zoned {
                 let Some(zone) = d.pointer("/LocalZones/0/href").and_then(Value::as_str) else {
                     continue; // no zone means nothing to command
                 };
                 let mut props = BTreeMap::new();
                 props.insert("Zone".into(), json!(zone));
                 props.insert("Device href".into(), json!(d.get("href").and_then(Value::as_str).unwrap_or("")));
+                props.insert("Kind".into(), json!(which.as_str()));
                 out.push(Candidate {
                     label: name,
                     room,
-                    kind: "light".into(),
-                    driver_id: DIMMER_ID.into(),
+                    kind: proxy.into(),
+                    driver_id: driver_id.into(),
                     properties: props,
+                    // Slats or not, which only the model knows — a roller shade offering a tilt
+                    // control is a control that does nothing.
+                    capabilities: if which == Kind::Shade {
+                        BTreeMap::from([("supports_tilt".to_string(), json!(kind.contains("Tilt")))])
+                    } else {
+                        BTreeMap::new()
+                    },
                     verified: "found on bridge".into(),
                     ..Default::default()
                 });
@@ -860,9 +961,15 @@ impl DriverModule for CasetaLeap {
     }
 
     fn on_command(&self, inst: &mut Instance, _proxy: LocalId, cmd: &str, args: &Args) -> Vec<HostCall> {
-        // The bridge and a Pico's keypad proxy both take no commands (see their manifests) —
-        // anything reaching here is for the dimmer's light proxy.
-        Self::on_dimmer_command(inst, cmd, args)
+        // The bridge and a Pico's keypad proxy both take no commands (see their manifests), so
+        // everything arriving here is for a zone — and which zone it is decides both what to
+        // send and what to say afterwards. See `Kind`.
+        match Kind::of(inst) {
+            Kind::Light => Self::on_dimmer_command(inst, cmd, args),
+            Kind::Switch => Self::on_switch_command(inst, cmd),
+            Kind::Fan => Self::on_fan_command(inst, cmd, args),
+            Kind::Shade => Self::on_shade_command(inst, cmd, args),
+        }
     }
 
     fn on_event(&self, inst: &mut Instance, _control: LocalId, note: &str, args: &Args) -> Vec<HostCall> {
@@ -933,6 +1040,15 @@ fn battery_percent(level: &str) -> Option<u8> {
     }
 }
 
+/// The one complaint worth making when a zone device has no zone: it was adopted by hand
+/// rather than through the bridge that knows its hrefs. Four command handlers now open with the
+/// same two lines, and this is the half of them that is worth saying once.
+fn unzoned() -> Vec<HostCall> {
+    vec![HostCall::warn(
+        "caseta-leap: this device has no Zone — adopt it through the bridge's setup flow",
+    )]
+}
+
 fn zone(inst: &Instance) -> Option<String> {
     inst.property("Zone")
         .as_str()
@@ -975,6 +1091,48 @@ fn go_to_level(zone: &str, level: u8, fade_secs: u64) -> Value {
     })
 }
 
+/// A plain level, with no fade. What a switch takes — it has no dimmer to fade — and what a
+/// shade takes for a position, since `GoToDimmedLevel` is a lighting command and a motor does
+/// not accept one.
+fn go_to_plain_level(zone: &str, level: u8) -> Value {
+    zone_command(zone, json!({
+        "CommandType": "GoToLevel",
+        "Parameter": [{ "Type": "Level", "Value": level }],
+    }))
+}
+
+/// The speed, in Lutron's spelling. `None` for a name this driver does not know, which is a
+/// rule asking for a speed the fan does not have rather than something to guess at.
+fn go_to_fan_speed(zone: &str, speed: &str) -> Option<Value> {
+    let theirs = FAN_SPEEDS.iter().find(|(ours, _)| *ours == speed).map(|(_, theirs)| *theirs)?;
+    Some(zone_command(zone, json!({
+        "CommandType": "GoToFanSpeed",
+        "FanSpeedParameters": { "FanSpeed": theirs },
+    })))
+}
+
+/// `Raise`, `Lower` and `Stop` take no parameters at all — a shade already knows which way it
+/// is allowed to go.
+fn shade_move(zone: &str, command: &str) -> Value {
+    zone_command(zone, json!({ "CommandType": command }))
+}
+
+fn go_to_tilt(zone: &str, tilt: u8) -> Value {
+    zone_command(zone, json!({
+        "CommandType": "GoToTilt",
+        "TiltParameters": { "Tilt": tilt },
+    }))
+}
+
+/// Everything above, wrapped the one way the bridge accepts a command.
+fn zone_command(zone: &str, command: Value) -> Value {
+    json!({
+        "CommuniqueType": "CreateRequest",
+        "Header": { "Url": format!("{zone}/commandprocessor") },
+        "Body": { "Command": command },
+    })
+}
+
 fn subscribe(zone: &str) -> Value {
     json!({ "CommuniqueType": "SubscribeRequest", "Header": { "Url": format!("{zone}/status") } })
 }
@@ -990,6 +1148,83 @@ fn report(level: u8) -> HostCall {
 }
 
 impl CasetaLeap {
+    /// A switched load. `GoToLevel` and not `GoToDimmedLevel`: there is no dimmer to fade, and
+    /// the level is the only two values it holds.
+    fn on_switch_command(inst: &mut Instance, cmd: &str) -> Vec<HostCall> {
+        let Some(z) = zone(inst) else { return unzoned() };
+        let on = match cmd {
+            "on" => true,
+            "off" => false,
+            // What it is now, inverted. The bridge has no toggle, and a driver that guessed
+            // would turn a lamp on that somebody had just turned off.
+            "toggle" => !inst.scratch.get("on").and_then(Value::as_bool).unwrap_or(false),
+            _ => return Vec::new(),
+        };
+        vec![tx(&go_to_plain_level(&z, if on { 100 } else { 0 }))]
+    }
+
+    fn on_fan_command(inst: &mut Instance, cmd: &str, args: &Args) -> Vec<HostCall> {
+        let Some(z) = zone(inst) else { return unzoned() };
+        match cmd {
+            "off" => vec![tx(&go_to_fan_speed(&z, "off").unwrap_or_else(|| {
+                // `Off` is not in `FAN_SPEEDS` — stopping is a command, not a speed — so it is
+                // spelled out here rather than smuggled into the speed table.
+                zone_command(&z, json!({
+                    "CommandType": "GoToFanSpeed",
+                    "FanSpeedParameters": { "FanSpeed": "Off" },
+                }))
+            }))],
+            // The speed it was last on. A fan turned on to a speed nobody chose is a fan that
+            // comes back at full in the middle of the night.
+            "on" => {
+                let last = inst
+                    .scratch
+                    .get("speed")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| FAN_SPEEDS[0].0.to_string());
+                go_to_fan_speed(&z, &last).map(|m| vec![tx(&m)]).unwrap_or_default()
+            }
+            "toggle" => {
+                let running = inst.scratch.get("on").and_then(Value::as_bool).unwrap_or(false);
+                let cmd = if running { "off" } else { "on" };
+                Self::on_fan_command(inst, cmd, args)
+            }
+            "set_speed" => {
+                let Some(speed) = args.get("speed").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                go_to_fan_speed(&z, speed).map(|m| vec![tx(&m)]).unwrap_or_else(|| {
+                    vec![HostCall::warn(&format!(
+                        "caseta-leap: this fan has no speed called `{speed}`"
+                    ))]
+                })
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A shade. Open and close are the ends of its travel rather than commands of their own,
+    /// which is why they are levels; `Raise`, `Lower` and `Stop` are the motor's own verbs and
+    /// take no parameters.
+    fn on_shade_command(inst: &mut Instance, cmd: &str, args: &Args) -> Vec<HostCall> {
+        let Some(z) = zone(inst) else { return unzoned() };
+        match cmd {
+            "open" => vec![tx(&go_to_plain_level(&z, 100))],
+            "close" => vec![tx(&go_to_plain_level(&z, 0))],
+            "stop" => vec![tx(&shade_move(&z, "Stop"))],
+            "set_position" => match args.get("position").and_then(Value::as_u64) {
+                Some(p) => vec![tx(&go_to_plain_level(&z, p.min(100) as u8))],
+                None => Vec::new(),
+            },
+            "set_tilt" => match args.get("tilt").and_then(Value::as_u64) {
+                Some(t) => vec![tx(&go_to_tilt(&z, t.min(100) as u8))],
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
     fn on_dimmer_command(inst: &mut Instance, cmd: &str, args: &Args) -> Vec<HostCall> {
         let Some(z) = zone(inst) else {
             return vec![HostCall::warn(
@@ -1052,6 +1287,72 @@ impl CasetaLeap {
             if href != mine {
                 continue;
             }
+            // What a zone reports depends on what is on the end of it, and so does what this
+            // owes upward: the same `ZoneStatus` carries a fan's speed, a shade's tilt and a
+            // dimmer's level, and the three proxies do not share a notification between them.
+            match Kind::of(inst) {
+                Kind::Fan => {
+                    let Some(theirs) = status.get("FanSpeed").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let ours = FAN_SPEEDS
+                        .iter()
+                        .find(|(_, t)| *t == theirs)
+                        .map(|(ours, _)| *ours);
+                    let running = ours.is_some();
+                    if inst.scratch.get("speed").and_then(Value::as_str) == ours
+                        && inst.scratch.get("on").and_then(Value::as_bool) == Some(running)
+                    {
+                        continue; // already knew
+                    }
+                    // A speed it is running at is remembered; `Off` is not, so that turning it
+                    // back on returns it to what somebody chose rather than to a stop.
+                    if let Some(speed) = ours {
+                        inst.scratch.insert("speed".into(), json!(speed));
+                    }
+                    inst.scratch.insert("on".into(), json!(running));
+                    let mut a = Args::new();
+                    a.insert("speed".into(), json!(ours.unwrap_or("off")));
+                    a.insert("on".into(), json!(running));
+                    out.push(HostCall::notify(1, "speed_changed", a));
+                    continue;
+                }
+                Kind::Shade => {
+                    if let Some(tilt) = status.get("Tilt").and_then(Value::as_u64) {
+                        let tilt = tilt.min(100) as u8;
+                        if inst.scratch.get("tilt").and_then(Value::as_u64) != Some(tilt as u64) {
+                            inst.scratch.insert("tilt".into(), json!(tilt));
+                            let mut a = Args::new();
+                            a.insert("tilt".into(), json!(tilt));
+                            out.push(HostCall::notify(1, "tilt_changed", a));
+                        }
+                    }
+                    let Some(level) = status.get("Level").and_then(Value::as_u64) else { continue };
+                    let position = level.min(100) as u8;
+                    if inst.scratch.get("level").and_then(Value::as_u64) == Some(position as u64) {
+                        continue;
+                    }
+                    inst.scratch.insert("level".into(), json!(position));
+                    let mut a = Args::new();
+                    a.insert("position".into(), json!(position));
+                    out.push(HostCall::notify(1, "position_changed", a));
+                    continue;
+                }
+                Kind::Switch => {
+                    let Some(level) = status.get("Level").and_then(Value::as_u64) else { continue };
+                    let on = level > 0;
+                    if inst.scratch.get("on").and_then(Value::as_bool) == Some(on) {
+                        continue;
+                    }
+                    inst.scratch.insert("on".into(), json!(on));
+                    let mut a = Args::new();
+                    a.insert("on".into(), json!(on));
+                    out.push(HostCall::notify(1, "switch_changed", a));
+                    continue;
+                }
+                Kind::Light => {}
+            }
+
             let Some(level) = status.get("Level").and_then(Value::as_u64) else { continue };
             let level = level.clamp(0, 100) as u8;
 
@@ -1390,6 +1691,165 @@ mod tests {
             "\"BatteryStatus\":{\"LevelState\":\"Flurgh\"}}}}\n"
         );
         assert!(CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &frame(odd)).is_empty());
+    }
+
+    /// Every zone behind the bridge looks the same on the wire, so what tells them apart is the
+    /// `DeviceType` table — transcribed from `pylutron-caseta`, because guessing which of forty
+    /// names is a shade is how a driver silently refuses to adopt somebody's hardware.
+    #[test]
+    fn each_leap_device_type_is_adopted_as_the_thing_it_actually_is() {
+        let device = |kind: &str| {
+            json!({
+                "href": "/device/2", "Name": "Thing", "FullyQualifiedName": ["Hall", "Thing"],
+                "DeviceType": kind, "LocalZones": [{ "href": "/zone/3" }],
+            })
+        };
+        let claimed = |kind: &str| {
+            let found = CasetaLeap::candidates(&json!({}), false, &[device(kind)], &[]);
+            let [c] = found.as_slice() else { panic!("{kind} was not adopted at all") };
+            (c.driver_id.clone(), c.kind.clone(), c.properties["Kind"].clone())
+        };
+
+        assert_eq!(claimed("WallDimmer"), (DIMMER_ID.into(), "light".into(), json!("light")));
+        assert_eq!(claimed("SunnataDimmer"), (DIMMER_ID.into(), "light".into(), json!("light")));
+        assert_eq!(claimed("WallSwitch"), (SWITCH_ID.into(), "switch".into(), json!("switch")));
+        assert_eq!(claimed("PowPakSwitch"), (SWITCH_ID.into(), "switch".into(), json!("switch")));
+        assert_eq!(claimed("CasetaFanSpeedController"), (FAN_ID.into(), "fan".into(), json!("fan")));
+        assert_eq!(claimed("SerenaRollerShade"), (SHADE_ID.into(), "blind".into(), json!("shade")));
+
+        // Slats or not is the model's business. A roller shade must not offer a tilt control.
+        let tilting = CasetaLeap::candidates(&json!({}), false, &[device("SerenaTiltOnlyWoodBlind")], &[]);
+        assert_eq!(tilting[0].capabilities["supports_tilt"], json!(true));
+        let rolling = CasetaLeap::candidates(&json!({}), false, &[device("SerenaRollerShade")], &[]);
+        assert_eq!(rolling[0].capabilities["supports_tilt"], json!(false));
+
+        // Something Lutron has not shipped yet is left alone rather than adopted as a guess.
+        assert!(CasetaLeap::candidates(&json!({}), false, &[device("FluxCapacitor")], &[]).is_empty());
+    }
+
+    /// The fan's two translations: a speed this house names, and the speed Lutron calls it.
+    #[test]
+    fn a_fan_speaks_the_houses_speeds_and_lutrons_on_the_wire() {
+        let mut inst = Instance::default();
+        inst.properties.insert("Zone".into(), json!("/zone/3"));
+        inst.properties.insert("Kind".into(), json!("fan"));
+
+        let mut args = Args::new();
+        args.insert("speed".into(), json!("medium_high"));
+        let calls = CasetaLeap::on_fan_command(&mut inst, "set_speed", &args);
+        let [HostCall::Tx { data, .. }] = calls.as_slice() else { panic!("expected one write") };
+        let sent: Value = driver_sdk::serde_json::from_slice(data).expect("valid JSON");
+        assert_eq!(sent["Body"]["Command"]["CommandType"], "GoToFanSpeed");
+        assert_eq!(sent["Body"]["Command"]["FanSpeedParameters"]["FanSpeed"], "MediumHigh");
+
+        // A speed this fan does not have is said out loud, not sent as itself.
+        let mut nonsense = Args::new();
+        nonsense.insert("speed".into(), json!("ludicrous"));
+        assert!(matches!(
+            CasetaLeap::on_fan_command(&mut inst, "set_speed", &nonsense).as_slice(),
+            [HostCall::Log { .. }],
+        ));
+
+        // And back: the bridge's spelling becomes the house's, and `Off` is not a speed.
+        let status = |speed: &str| {
+            let mut a = Args::new();
+            a.insert("data".into(), json!(format!(
+                "{{\"Body\":{{\"ZoneStatus\":{{\"Zone\":{{\"href\":\"/zone/3\"}},\"FanSpeed\":\"{speed}\"}}}}}}\n"
+            )));
+            a
+        };
+        let calls = CasetaLeap::on_dimmer_event(&mut inst, "rx", &status("MediumHigh"));
+        match calls.as_slice() {
+            [HostCall::Notify { name, args, .. }] => {
+                assert_eq!(name, "speed_changed");
+                assert_eq!(args["speed"], json!("medium_high"));
+                assert_eq!(args["on"], json!(true));
+            }
+            other => panic!("expected a speed report, got {other:?}"),
+        }
+        let calls = CasetaLeap::on_dimmer_event(&mut inst, "rx", &status("Off"));
+        match calls.as_slice() {
+            [HostCall::Notify { args, .. }] => {
+                assert_eq!(args["on"], json!(false));
+                assert_eq!(args["speed"], json!("off"));
+            }
+            other => panic!("expected a stop, got {other:?}"),
+        }
+        // Turning it back on returns it to the speed somebody chose, not to full.
+        let on = CasetaLeap::on_fan_command(&mut inst, "on", &Args::new());
+        let [HostCall::Tx { data, .. }] = on.as_slice() else { panic!("expected one write") };
+        let sent: Value = driver_sdk::serde_json::from_slice(data).expect("valid JSON");
+        assert_eq!(sent["Body"]["Command"]["FanSpeedParameters"]["FanSpeed"], "MediumHigh");
+    }
+
+    /// A shade's ends are levels and its verbs are the motor's. `GoToDimmedLevel` is a lighting
+    /// command and a motor does not take one.
+    #[test]
+    fn a_shade_is_driven_by_level_and_stopped_by_its_own_verb() {
+        let mut inst = Instance::default();
+        inst.properties.insert("Zone".into(), json!("/zone/7"));
+        inst.properties.insert("Kind".into(), json!("shade"));
+        let sent = |inst: &mut Instance, cmd: &str, args: &Args| {
+            let calls = CasetaLeap::on_shade_command(inst, cmd, args);
+            let [HostCall::Tx { data, .. }] = calls.as_slice() else { panic!("expected one write") };
+            driver_sdk::serde_json::from_slice::<Value>(data).expect("valid JSON")
+        };
+
+        let open = sent(&mut inst, "open", &Args::new());
+        assert_eq!(open["Body"]["Command"]["CommandType"], "GoToLevel");
+        assert_eq!(open["Body"]["Command"]["Parameter"][0]["Value"], 100);
+        assert_eq!(sent(&mut inst, "close", &Args::new())["Body"]["Command"]["Parameter"][0]["Value"], 0);
+        assert_eq!(sent(&mut inst, "stop", &Args::new())["Body"]["Command"]["CommandType"], "Stop");
+
+        let mut tilt = Args::new();
+        tilt.insert("tilt".into(), json!(40));
+        let tilted = sent(&mut inst, "set_tilt", &tilt);
+        assert_eq!(tilted["Body"]["Command"]["CommandType"], "GoToTilt");
+        assert_eq!(tilted["Body"]["Command"]["TiltParameters"]["Tilt"], 40);
+
+        // And its status is a position, not a brightness.
+        let mut a = Args::new();
+        a.insert("data".into(), json!(
+            "{\"Body\":{\"ZoneStatus\":{\"Zone\":{\"href\":\"/zone/7\"},\"Level\":60}}}\n"
+        ));
+        match CasetaLeap::on_dimmer_event(&mut inst, "rx", &a).as_slice() {
+            [HostCall::Notify { name, args, .. }] => {
+                assert_eq!(name, "position_changed");
+                assert_eq!(args["position"], json!(60));
+            }
+            other => panic!("expected a position, got {other:?}"),
+        }
+    }
+
+    /// A switched load has no fade and no levels in between.
+    #[test]
+    fn a_switch_is_sent_a_plain_level_and_toggles_from_what_it_last_reported() {
+        let mut inst = Instance::default();
+        inst.properties.insert("Zone".into(), json!("/zone/9"));
+        inst.properties.insert("Kind".into(), json!("switch"));
+
+        let calls = CasetaLeap::on_switch_command(&mut inst, "on");
+        let [HostCall::Tx { data, .. }] = calls.as_slice() else { panic!("expected one write") };
+        let sent: Value = driver_sdk::serde_json::from_slice(data).expect("valid JSON");
+        assert_eq!(sent["Body"]["Command"]["CommandType"], "GoToLevel", "no fade on a switch");
+        assert_eq!(sent["Body"]["Command"]["Parameter"][0]["Value"], 100);
+
+        // The bridge says it is on; a toggle then has to turn it off rather than on again.
+        let mut a = Args::new();
+        a.insert("data".into(), json!(
+            "{\"Body\":{\"ZoneStatus\":{\"Zone\":{\"href\":\"/zone/9\"},\"Level\":100}}}\n"
+        ));
+        match CasetaLeap::on_dimmer_event(&mut inst, "rx", &a).as_slice() {
+            [HostCall::Notify { name, args, .. }] => {
+                assert_eq!(name, "switch_changed");
+                assert_eq!(args["on"], json!(true));
+            }
+            other => panic!("expected a switch report, got {other:?}"),
+        }
+        let calls = CasetaLeap::on_switch_command(&mut inst, "toggle");
+        let [HostCall::Tx { data, .. }] = calls.as_slice() else { panic!("expected one write") };
+        let sent: Value = driver_sdk::serde_json::from_slice(data).expect("valid JSON");
+        assert_eq!(sent["Body"]["Command"]["Parameter"][0]["Value"], 0, "on, so a toggle is off");
     }
 
     #[test]

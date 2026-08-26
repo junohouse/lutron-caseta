@@ -1,0 +1,44 @@
+[driver]
+id = "lutron.caseta.leap_switch"
+name = "Lutron Caséta Switch"
+manufacturer = "Lutron"
+version = "1.0.0"
+runtime = "wasm"
+# What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
+# installer change it from the Logs page; a driver that declares nothing sits at `info` with
+# no control. Everything it prints rather than logs is taken as `debug` and held to this too.
+log_level = "info"
+parent = "lutron.caseta.leap_bridge"
+
+# A `switch` and not a `light` with `dimmer = false`. The contract's own rule: use `light` if
+# somebody thinks of it as a light, this if they do not — and Lutron files these separately for
+# the same reason, since a `PlugInSwitch` is as often a fan or a pump as it is a lamp. A load
+# that is really a light is still adoptable as one by hand; what it must not do is arrive
+# claiming a brightness it cannot hold.
+[[proxy]]
+id = 1
+type = "switch"
+primary = true
+
+[[control]]
+id = 1
+kind = "network"
+name = "LEAP"
+port = 8081
+tls = true
+keepalive = true
+# The bridge hangs up a client that says nothing — within minutes, confirmed on hardware. Core
+# notices and dials again, but every report in the gap is gone. `/server/1/status/ping` answers
+# `OnePingResponse` with the LEAP version and touches nothing. See `ControlDecl::heartbeat`.
+heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/ping"}}'
+heartbeat_secs = 60
+
+[[property]]
+name = "Device href"
+type = "string"
+tooltip = "The device's own href on the bridge — filled in automatically when adopted"
+
+[[property]]
+name = "Zone"
+type = "string"
+tooltip = "The device's zone href on the bridge — filled in automatically when adopted"

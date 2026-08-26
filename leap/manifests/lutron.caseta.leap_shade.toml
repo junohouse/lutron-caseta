@@ -1,0 +1,43 @@
+[driver]
+id = "lutron.caseta.leap_shade"
+name = "Lutron Caséta Shade"
+manufacturer = "Lutron"
+version = "1.0.0"
+runtime = "wasm"
+# What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
+# installer change it from the Logs page; a driver that declares nothing sits at `info` with
+# no control. Everything it prints rather than logs is taken as `debug` and held to this too.
+log_level = "info"
+parent = "lutron.caseta.leap_bridge"
+
+# Position and stop for every shade Lutron makes; tilt only for the ones that have slats, which
+# is a property of the model and is filled in at adoption rather than declared here — a roller
+# shade offering a tilt control is a control that does nothing. See `shade_capabilities`.
+[[proxy]]
+id = 1
+type = "blind"
+primary = true
+capabilities = { supports_position = true, supports_stop = true }
+
+[[control]]
+id = 1
+kind = "network"
+name = "LEAP"
+port = 8081
+tls = true
+keepalive = true
+# The bridge hangs up a client that says nothing — within minutes, confirmed on hardware. Core
+# notices and dials again, but every report in the gap is gone. `/server/1/status/ping` answers
+# `OnePingResponse` with the LEAP version and touches nothing. See `ControlDecl::heartbeat`.
+heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/ping"}}'
+heartbeat_secs = 60
+
+[[property]]
+name = "Device href"
+type = "string"
+tooltip = "The device's own href on the bridge — filled in automatically when adopted"
+
+[[property]]
+name = "Zone"
+type = "string"
+tooltip = "The device's zone href on the bridge — filled in automatically when adopted"

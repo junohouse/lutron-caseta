@@ -57,13 +57,46 @@ A Pico adopted before this existed has `has_battery: false` in its stored contra
 rightly refuses the notification — nothing rewrites a saved house. Adopt it again through the
 bridge and it reconciles in place, keeping its id and its rules.
 
-## What this does not drive
+## What a zone turns out to be
 
-Dimmers and Picos. Switches, fan controllers, occupancy sensors, Serena shades and the
-`/virtualbutton` scenes a bridge publishes are all real LEAP things and none of them are here.
-Each needs a `DeviceType` arm and a manifest, and — more to the point — hardware to check
-against: a switched zone reports `SwitchedLevel` where a dimmer reports `Level`, and guessing
-which commands a load accepts is how a driver ends up shipping something nobody has pressed.
+Dimmers, switches, fan controllers and shades are all `/zone`s, and on the wire they are
+indistinguishable — same status shape, same command processor. What tells them apart is
+`DeviceType`, so the four lists (`DIMMABLE`, `SWITCHED`, `FANS`, `COVERS`) are transcribed from
+`pylutron-caseta`'s own `_LEAP_DEVICE_TYPES` rather than guessed. A type missing from them is a
+device that silently cannot be added, which is why they are long.
+
+The answer is written down as a `Kind` property at adoption and read back on every command and
+every status, because `Instance` carries properties and nothing else — a driver has no other way
+to know what it is. Anything adopted before that existed has no `Kind` and reads as a light,
+which is what it was.
+
+What each one sends is not interchangeable, and that is the reason for the split rather than a
+`dimmer = false` capability:
+
+| | command | status field |
+| --- | --- | --- |
+| dimmer | `GoToDimmedLevel` with a fade | `Level` |
+| switch | `GoToLevel` — no fade to give it | `Level`, as 0 or 100 |
+| fan | `GoToFanSpeed` | `FanSpeed`, a word |
+| shade | `GoToLevel`, `Raise`/`Lower`/`Stop`, `GoToTilt` | `Level` and `Tilt` |
+
+Fan speeds are the house's words on this side and Lutron's on the wire — a rule here says
+`medium_high` and only `FAN_SPEEDS` knows that LEAP calls it `MediumHigh`. Shade tilt is a
+capability the model decides at adoption: a roller shade offering a tilt control is a control
+that does nothing.
+
+## What this still does not drive
+
+Occupancy sensors. They are the one LEAP group that is not a zone — they arrive through
+`/occupancygroup`, a separate collection with its own subscription — so they want their own read
+rather than another `DeviceType` arm.
+
+The `/virtualbutton` scenes a bridge publishes are also absent. Those are a Caséta scene, which
+is a question about how a provider's scenes meet the house's own, not about this protocol.
+
+None of the four above has been driven against real hardware — there was none to hand. The wire
+formats come from `pylutron-caseta`, the tests pin the translations in both directions, and the
+Pico path is verified end to end; the rest is faithful transcription that nobody has pressed.
 
 ## Checking fixtures against real hardware
 

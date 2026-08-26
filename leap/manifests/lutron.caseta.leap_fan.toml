@@ -1,0 +1,44 @@
+[driver]
+id = "lutron.caseta.leap_fan"
+name = "Lutron Caséta Fan"
+manufacturer = "Lutron"
+version = "1.0.0"
+runtime = "wasm"
+# What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
+# installer change it from the Logs page; a driver that declares nothing sits at `info` with
+# no control. Everything it prints rather than logs is taken as `debug` and held to this too.
+log_level = "info"
+parent = "lutron.caseta.leap_bridge"
+
+# Lutron's four speeds, in the house's own words rather than the wire's. `MediumHigh` is what
+# LEAP calls the third one and `medium_high` is what a rule written here says; the driver holds
+# the translation, which is where a vendor's spelling belongs. Off is not in the list — stopping
+# is a command, not a speed. See the `fan` contract.
+[[proxy]]
+id = 1
+type = "fan"
+primary = true
+capabilities = { speeds = ["low", "medium", "medium_high", "high"] }
+
+[[control]]
+id = 1
+kind = "network"
+name = "LEAP"
+port = 8081
+tls = true
+keepalive = true
+# The bridge hangs up a client that says nothing — within minutes, confirmed on hardware. Core
+# notices and dials again, but every report in the gap is gone. `/server/1/status/ping` answers
+# `OnePingResponse` with the LEAP version and touches nothing. See `ControlDecl::heartbeat`.
+heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/ping"}}'
+heartbeat_secs = 60
+
+[[property]]
+name = "Device href"
+type = "string"
+tooltip = "The device's own href on the bridge — filled in automatically when adopted"
+
+[[property]]
+name = "Zone"
+type = "string"
+tooltip = "The device's zone href on the bridge — filled in automatically when adopted"
