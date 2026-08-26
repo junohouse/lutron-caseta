@@ -659,7 +659,7 @@ impl CasetaLeap {
         const DIMMABLE: &[&str] = &["WallDimmer", "PlugInDimmer", "InLineDimmer", "Dimmed"];
         for d in devices {
             let kind = d.get("DeviceType").and_then(Value::as_str).unwrap_or("");
-            let name = caseta_name(d);
+            let (name, room) = caseta_name(d);
 
             if DIMMABLE.contains(&kind) {
                 let Some(zone) = d.pointer("/LocalZones/0/href").and_then(Value::as_str) else {
@@ -669,6 +669,7 @@ impl CasetaLeap {
                 props.insert("Zone".into(), json!(zone));
                 out.push(Candidate {
                     label: name,
+                    room,
                     kind: "light".into(),
                     driver_id: DIMMER_ID.into(),
                     properties: props,
@@ -690,6 +691,7 @@ impl CasetaLeap {
                 let labels: Vec<&str> = keys.iter().map(|(_, label)| label.as_str()).collect();
                 out.push(Candidate {
                     label: name,
+                    room,
                     kind: "keypad".into(),
                     driver_id: PICO_ID.into(),
                     properties: props,
@@ -704,26 +706,37 @@ impl CasetaLeap {
     }
 }
 
-/// What the Caséta app calls this device.
+/// What the Caséta app calls this device, and which of its areas it sits in.
 ///
-/// `Name` alone is the leaf — a Pico in the kitchen is called `Pico`, and so is the one in the
-/// hall. `FullyQualifiedName` is the same name with the area in front of it, which is what the
-/// app shows and what somebody adopting one recognises: `Kitchen Pico`. Falls back to `Name`
-/// for anything the bridge files outside an area, such as the bridge itself.
-fn caseta_name(device: &Value) -> String {
-    let parts: Vec<&str> = device
+/// `FullyQualifiedName` is both, in one field: the path of areas a device is filed under with
+/// its own name on the end — `["Kitchen", "Pico"]`. So the name is the last element and the
+/// room is the one before it, which is the innermost area rather than the outermost. `Name`
+/// alone is the same leaf and is what this falls back to; the areas are what somebody sat down
+/// in the app and filed, and throwing them away means filing a whole house a second time.
+///
+/// Cross-checked against `/area` on real hardware rather than assumed: `/device/6` carries
+/// `AssociatedArea: /area/4`, and `/area/4` is `Kitchen`, which is what the path says too. That
+/// agreement is why this does not spend a third read resolving the href.
+///
+/// The room is a *suggestion* — see `Candidate::room`. Core matches or creates one at the
+/// moment somebody adopts, with the list in front of them, and never for a bridge: a hub lives
+/// in a cupboard and the cupboard is not a room.
+fn caseta_name(device: &Value) -> (String, String) {
+    let path: Vec<&str> = device
         .get("FullyQualifiedName")
         .and_then(Value::as_array)
         .map(|parts| parts.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    if !parts.is_empty() {
-        return parts.join(" ");
-    }
-    device
-        .get("Name")
-        .and_then(Value::as_str)
+    let name = path
+        .last()
+        .copied()
+        .or_else(|| device.get("Name").and_then(Value::as_str))
         .unwrap_or("Caséta device")
-        .to_string()
+        .to_string();
+    // Nothing but a name means the bridge files it at the top of the project, under no area at
+    // all — which is an answer, and not one to guess past.
+    let room = if path.len() >= 2 { path[path.len() - 2] } else { "" };
+    (name, room.to_string())
 }
 
 /// Any Pico remote — `Pico2Button`, `Pico3ButtonRaiseLower`, `Pico4Button` and the rest all
@@ -1178,7 +1191,11 @@ mod tests {
         let found = CasetaLeap::candidates(&json!({}), false, &devices, &buttons);
         let [pico] = found.as_slice() else { panic!("expected one candidate, got {found:?}") };
 
-        assert_eq!(pico.label, "Kitchen Pico", "the name the Caséta app shows");
+        assert_eq!(pico.label, "Pico", "the name, which is the leaf of the qualified one");
+        assert_eq!(
+            pico.room, "Kitchen",
+            "and the area it was filed under, offered as the room to adopt it into",
+        );
         assert_eq!(pico.capabilities["key_count"], json!(2));
         assert_eq!(pico.capabilities["key_labels"], json!("On,Off"));
         // On is button 0 and Off is button *2* — not the first two the bridge listed, which is
@@ -1186,6 +1203,29 @@ mod tests {
         assert_eq!(pico.properties["Button 1 href"], json!("/button/9"));
         assert_eq!(pico.properties["Button 2 href"], json!("/button/11"));
         assert!(!pico.properties.contains_key("Button 3 href"));
+    }
+
+    /// A device the bridge files at the top of the project, and one filed two areas deep.
+    #[test]
+    fn the_room_offered_is_the_innermost_area_or_none_at_all() {
+        let buttons = vec![json!({
+            "href": "/button/1", "ButtonNumber": 0, "Parent": { "href": "/buttongroup/1" },
+        })];
+        let of = |fqn: Value| {
+            let device = json!({
+                "Name": "Pico",
+                "FullyQualifiedName": fqn,
+                "DeviceType": "Pico2Button",
+                "ButtonGroups": [{ "href": "/buttongroup/1" }],
+            });
+            let found = CasetaLeap::candidates(&json!({}), false, &[device], &buttons);
+            let [pico] = found.as_slice() else { panic!("expected one candidate") };
+            (pico.label.clone(), pico.room.clone())
+        };
+
+        assert_eq!(of(json!(["Upstairs", "Kitchen", "Pico"])), ("Pico".into(), "Kitchen".into()));
+        // Under no area: an answer, and not one to guess past by reaching for the name itself.
+        assert_eq!(of(json!(["Pico"])), ("Pico".into(), String::new()));
     }
 
     /// The one model there is real hardware for here: a PJ-3BRL, five keys, whose buttons come
