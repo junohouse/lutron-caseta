@@ -85,6 +85,26 @@ Fan speeds are the house's words on this side and Lutron's on the wire — a rul
 capability the model decides at adoption: a roller shade offering a tilt control is a control
 that does nothing.
 
+## A press is a click, and hold is not offered
+
+The keypad contract has no `pressed`, and `released` means "a long press ended" and is gated
+behind `has_hold`. This driver sent both for a while and core refused both, so every press did
+nothing and the only sign was one line in the log about an undeclared capability. `clicked` is
+the one every keypad has and the one every rule is written against, and it goes out on the
+press — this driver cannot tell a hold from a click, so there is nothing to wait for, and
+waiting for the release would add the length of somebody's thumb to every light in the house.
+
+`has_hold` stays false, and it has to. Lutron reports `Press` and `Release` and leaves the
+timing to whoever is listening — but a wasm driver has no clock: there is no timer host call and
+an `rx` event carries no timestamp, so it cannot measure how long a button was down. Declaring
+hold anyway would mean firing `clicked` *and* `held` on every tap, which on a key wired to both
+toggles the light and starts a ramp at the same time.
+
+What it would take is a way for a driver to ask core to wake it after N milliseconds. Then the
+Pico could do the discrimination Lutron expects of a listener, and `held`/`released` would meet
+`ramp_start`/`ramp_stop` on the far side — that pair is gated on `supports_ramp`, which the
+dimmer here declares, and its own doc says it exists "for held keypad buttons".
+
 ## Occupancy is an area, not a sensor
 
 Lutron models it that way and it is the more useful shape: two sensors covering one room are one

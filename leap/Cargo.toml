@@ -18,3 +18,10 @@ driver-sdk = { git = "https://github.com/junohouse/driver-sdk", branch = "main" 
 # Working on core and this driver at once: point the SDK at a local checkout.
 #   [patch."https://github.com/junohouse/driver-sdk"]
 #   driver-sdk = { path = "../../../driver-sdk" }
+
+[dev-dependencies]
+# The proxy contracts, for tests only. Not a normal dependency: it pulls in a TOML parser and
+# this crate compiles to wasm that ships in every project. A dev-dependency is compiled for
+# `cargo test` and left out of `cargo build`, which is exactly the split wanted here — see
+# `every_notification_this_driver_sends_is_one_its_contract_allows`.
+driver-sdk = { git = "https://github.com/junohouse/driver-sdk", branch = "main", features = ["contracts"] }

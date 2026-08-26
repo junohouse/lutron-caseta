@@ -190,6 +190,13 @@ const PICO_KEYS: &[(&str, &[(u64, &str)])] = &[
     ),
 ];
 
+/// How long a held keypad button takes to run a lamp from one end of its travel to the other.
+///
+/// Four seconds, which is what it takes to land on a level somebody wanted rather than to
+/// arrive at full before their thumb has moved. Long enough to aim, short enough not to feel
+/// like waiting.
+const RAMP_SECS: u64 = 4;
+
 /// How many one-second polls to give someone to walk over and press the button.
 const PAIR_WAIT_SECS: u32 = 30;
 
@@ -1494,11 +1501,22 @@ impl CasetaLeap {
                 (if on { 0 } else if last == 0 { 100 } else { last }, secs)
             }
             "set_level" => (args.get("level").and_then(Value::as_u64).unwrap_or(0) as u8, secs),
+            // Held on a keypad: fade toward the end of the travel and wait to be stopped. The
+            // level here is a destination, not a state, and the two must not be confused — this
+            // used to write 100 into `scratch` and report it, so the house believed the lamp was
+            // already at full the instant somebody touched the button, and `ramp_stop` then
+            // "stopped" it by jumping to the 100 it had invented. A hold that ended early left
+            // the light at exactly the brightness the driver had lied about.
+            //
+            // So a ramp reports nothing and remembers nothing. The bridge pushes the zone's
+            // level as it moves, and that is what the house learns from — see `on_dimmer_event`.
             "ramp_start" => {
                 let up = args.get("direction").and_then(Value::as_str) == Some("up");
-                (if up { 100 } else { 1 }, 4)
+                return vec![tx(&go_to_level(&z, if up { 100 } else { 1 }, RAMP_SECS))];
             }
-            "ramp_stop" => (last, 0),
+            // Where it actually got to, held there. `last` is the newest level the *bridge*
+            // reported, which during a fade is where the light is rather than where it was sent.
+            "ramp_stop" => return vec![tx(&go_to_level(&z, last, 0))],
             other => return vec![HostCall::warn(format!("caseta-leap: unhandled `{other}`"))],
         };
 
@@ -1728,23 +1746,35 @@ impl CasetaLeap {
             let Some(key) = buttons.iter().find(|(_, h)| h == href).map(|(k, _)| *k) else {
                 continue; // someone else's Pico, on the same event stream
             };
-            // Only Press/Release is real on Caséta's own bridge — Lutron leaves click/hold
-            // timing to whoever is listening rather than doing it on-device, which is why
-            // this manifest declares neither `has_hold` nor `has_double`.
-            let name = match status.pointer("/ButtonEvent/EventType").and_then(Value::as_str) {
-                Some("Press") => "pressed",
-                Some("Release") => "released",
+            // `clicked`, which is the only action every keypad has and the one every rule is
+            // written against. This used to send `pressed` and `released`, and both were wrong:
+            // the contract has no `pressed` at all, and `released` is gated behind `has_hold`
+            // because it means "a long press ended" — its own doc says a plain click reports
+            // `clicked` and nothing else. So core refused both, every press did nothing, and the
+            // only sign was a line in the log saying a capability was not declared.
+            //
+            // On the press rather than the release. Lutron leaves click and hold timing to
+            // whoever is listening, and this driver declares `has_hold = false` — it cannot tell
+            // a hold from a click, so every press is a click and there is nothing to wait for.
+            // Waiting for the release to be sure would only add the length of somebody's thumb
+            // to every light in the house.
+            match status.pointer("/ButtonEvent/EventType").and_then(Value::as_str) {
+                Some("Press") => {}
+                // Real, and nothing to say about it: the click was already reported. Kept as an
+                // arm rather than a fallthrough so a firmware that sends something else still
+                // reaches the `continue` below.
+                Some("Release") => continue,
                 _ => continue, // a firmware shape this driver does not know yet
-            };
+            }
             let mut a = Args::new();
             a.insert("key".into(), json!(key));
-            out.push(HostCall::notify(1, name, a));
+            out.push(HostCall::notify(1, "clicked", a));
             // Same reasoning as the dimmer's own tile: a keypad has nothing else to draw, and
             // one showing blank forever reads as broken rather than idle.
             out.push(HostCall::SetState {
                 proxy: 1,
                 key: "last_action".into(),
-                value: json!(format!("key {key} {name}")),
+                value: json!(format!("key {key} clicked")),
             });
         }
         out
@@ -1830,6 +1860,118 @@ mod tests {
             "{\"Body\":{\"Status\":{\"Permissions\":[]}}}\n{\"CommuniqueType\":\"SubscribeResponse\"}\n"
         ));
         assert!(!CasetaLeap::button_pressed(""));
+    }
+
+    /// Every notification this driver can emit, held against the contract of the proxy it is
+    /// emitted on — with that proxy's *adopted* capabilities, since half of them are gated.
+    ///
+    /// This is the check that was missing when `pressed` and `released` shipped. Core refuses an
+    /// illegal notification at runtime and says so in the log, which is the right thing for it
+    /// to do and the wrong place to find out: the house is installed, the button is wired, and
+    /// the only symptom is that nothing happens.
+    #[test]
+    fn every_notification_this_driver_sends_is_one_its_contract_allows() {
+        let registry = driver_sdk::proxy::ProxyRegistry::bundled().expect("bundled contracts");
+        let claims: &[(&str, &[(&str, Value)], &[&str])] = &[
+            ("keypad", &[("has_battery", json!(true))],
+                &["clicked", "battery_changed", "online_changed"]),
+            ("light", &[("dimmer", json!(true)), ("supports_ramp", json!(true))],
+                &["level_changed", "online_changed"]),
+            ("switch", &[], &["switch_changed", "online_changed"]),
+            ("fan", &[], &["speed_changed", "online_changed"]),
+            ("blind", &[("supports_tilt", json!(true))],
+                &["position_changed", "tilt_changed", "online_changed"]),
+            ("sensor", &[("kind", json!("occupancy")), ("is_boolean", json!(true))],
+                &["detected_changed", "online_changed"]),
+        ];
+
+        let no_args = BTreeMap::new();
+        for (proxy_name, caps, sends) in claims {
+            let proxy = registry
+                .get(proxy_name)
+                .unwrap_or_else(|| panic!("no `{proxy_name}` contract"));
+            let declared: BTreeMap<String, Value> =
+                caps.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+            let resolved = proxy
+                .resolve(&declared)
+                .unwrap_or_else(|e| panic!("`{proxy_name}` does not resolve: {e:?}"));
+            for notification in *sends {
+                // Names only: whether each carries the right arguments is the business of the
+                // handler tests above, which drive real frames through and read what comes out.
+                // Only the two failures that mean "this driver must not send this at all": the
+                // name does not exist, or the capability gating it was never declared. A missing
+                // argument is not one of those — whether each notification carries the right
+                // ones is the business of the handler tests above, which drive real frames
+                // through and read what comes out.
+                match proxy.validate_notification(&resolved, notification, &no_args) {
+                    Err(why @ driver_sdk::proxy::CallError::NoSuchCommand(_))
+                    | Err(why @ driver_sdk::proxy::CallError::Unsupported { .. }) => {
+                        panic!("`{proxy_name}` may not send `{notification}`: {why}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // And the two that started this, still refused — so this test would have caught them.
+        let keypad = registry.get("keypad").expect("keypad contract");
+        let quiet = keypad
+            .resolve(&BTreeMap::from([("has_hold".to_string(), json!(false))]))
+            .expect("a keypad with no hold is a keypad");
+        for illegal in ["released", "pressed"] {
+            assert!(
+                keypad.validate_notification(&quiet, illegal, &no_args).is_err(),
+                "`{illegal}` must not be sendable by a keypad that declares no hold",
+            );
+        }
+    }
+
+    /// Hold-to-dim, which is the pairing a keypad's `held`/`released` exists for: `ramp_start`
+    /// fades toward an end of the travel, `ramp_stop` holds it where it got to.
+    ///
+    /// The bug this pins: `ramp_start` wrote its *destination* into state and reported it, so
+    /// the house believed the lamp was at full the instant a thumb touched the button — and
+    /// `ramp_stop` then "stopped" it by jumping to the level the driver had invented. Letting
+    /// go early left the light exactly where the lie said it was.
+    #[test]
+    fn a_ramp_reports_nothing_and_stops_where_the_light_actually_got_to() {
+        let mut inst = Instance::default();
+        inst.properties.insert("Zone".into(), json!("/zone/3"));
+        let sent = |calls: &[HostCall]| -> Value {
+            let [HostCall::Tx { data, .. }] = calls else { panic!("expected one write, got {calls:?}") };
+            driver_sdk::serde_json::from_slice(data).expect("valid JSON")
+        };
+
+        let up = {
+            let mut a = Args::new();
+            a.insert("direction".into(), json!("up"));
+            a
+        };
+        let start = CasetaLeap::on_dimmer_command(&mut inst, "ramp_start", &up);
+        let msg = sent(&start);
+        assert_eq!(msg["Body"]["Command"]["DimmedLevelParameters"]["Level"], 100);
+        assert_eq!(msg["Body"]["Command"]["DimmedLevelParameters"]["FadeTime"], "00:00:04");
+        assert!(
+            !start.iter().any(|c| matches!(c, HostCall::Notify { .. })),
+            "a ramp has not arrived anywhere yet, so it reports nothing",
+        );
+        assert!(
+            inst.scratch.get("level").is_none(),
+            "and remembers nothing — the bridge is what says where the light is",
+        );
+
+        // The bridge reports the light passing 42 on its way up, and the thumb comes off.
+        let mut heard = Args::new();
+        heard.insert("data".into(), json!(
+            "{\"Body\":{\"ZoneStatus\":{\"Zone\":{\"href\":\"/zone/3\"},\"Level\":42}}}\n"
+        ));
+        CasetaLeap::on_dimmer_event(&mut inst, "rx", &heard);
+        let stop = sent(&CasetaLeap::on_dimmer_command(&mut inst, "ramp_stop", &Args::new()));
+        assert_eq!(
+            stop["Body"]["Command"]["DimmedLevelParameters"]["Level"], 42,
+            "stopping holds it where it got to, not where it was headed",
+        );
+        assert_eq!(stop["Body"]["Command"]["DimmedLevelParameters"]["FadeTime"], "00:00:00");
     }
 
     #[test]
@@ -2265,7 +2407,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pico_event_reports_only_its_own_button_and_only_press_or_release() {
+    fn a_press_is_reported_as_the_click_every_keypad_has() {
         let buttons = vec![(1u64, "/button/9".to_string()), (2u64, "/button/10".to_string())];
         let mut args = Args::new();
         args.insert(
@@ -2291,7 +2433,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(notify_names, vec!["pressed", "released"]);
+        // The bug this pins: this used to send `pressed` and `released`, and core refused both —
+        // the keypad contract has no `pressed` at all, and `released` means "a long press
+        // ended" and is gated behind `has_hold`. Every press did nothing, and the only sign was
+        // one line in the log about an undeclared capability. `clicked` is the one every keypad
+        // has and the one every rule is written against.
+        assert_eq!(notify_names, vec!["clicked"], "one click on the press, nothing on the release");
 
         // An event that is neither Press nor Release, and one whose note is not `rx` at all:
         // both produce nothing rather than a guess.
