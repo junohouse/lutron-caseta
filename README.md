@@ -132,14 +132,13 @@ zone, and none of them is the right place to ask what the *bridge* knows.
 ## The bridge runs out of connections at nine
 
 Measured, not assumed: a Smart Bridge 2 accepts nine concurrent LEAP connections and resets the
-tenth. Core holds one per device, so a house with the bridge and eight children is at the
-ceiling, and the ninth device silently never connects.
+tenth. That is why the bridge holds the connection and everything behind it speaks over that one
+— core shares a held line with the children of the device that owns it, so a Caséta house is one
+socket rather than one per device. Without that, a dozen dimmers would have had some that never
+connected, in silence.
 
-That is fine for a handful of Picos and wrong for a real Caséta install. The fix is not in this
-driver — core keys a held connection by device, and everything behind one bridge shares an
-address and a port, so the connections could be shared. `deliver_stream_frame` already fans a
-frame out to every device behind the one that received it, which suggests the design was
-expecting this.
+It also means the bridge's own `[[control]]` is not optional decoration. It is the socket the
+whole system talks over.
 
 None of the four above has been driven against real hardware — there was none to hand. The wire
 formats come from `pylutron-caseta`, the tests pin the translations in both directions, and the
