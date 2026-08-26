@@ -85,25 +85,23 @@ Fan speeds are the house's words on this side and Lutron's on the wire — a rul
 capability the model decides at adoption: a roller shade offering a tilt control is a control
 that does nothing.
 
-## A press is a click, and hold is not offered
+## A press, a hold, and the line between them
 
-The keypad contract has no `pressed`, and `released` means "a long press ended" and is gated
-behind `has_hold`. This driver sent both for a while and core refused both, so every press did
-nothing and the only sign was one line in the log about an undeclared capability. `clicked` is
-the one every keypad has and the one every rule is written against, and it goes out on the
-press — this driver cannot tell a hold from a click, so there is nothing to wait for, and
-waiting for the release would add the length of somebody's thumb to every light in the house.
+Lutron reports `Press` and `Release` and nothing else, and leaves the decision of what counts as
+a hold to whoever is listening. This driver is that listener: a press asks core for a wake-up
+(`HostCall::After`, half a second), and what the press turns out to be is decided by which
+arrives first. Wake-up first and it is a `held`, ended by a `released`. Release first and it was
+a `clicked` all along.
 
-`has_hold` stays false, and it has to. Lutron reports `Press` and `Release` and leaves the
-timing to whoever is listening — but a wasm driver has no clock: there is no timer host call and
-an `rx` event carries no timestamp, so it cannot measure how long a button was down. Declaring
-hold anyway would mean firing `clicked` *and* `held` on every tap, which on a key wired to both
-toggles the light and starts a ramp at the same time.
+That is why `has_hold` is true here, and why it could not be until core grew a clock a driver
+could ask for — a driver has no time of its own, so before that it genuinely could not tell the
+two apart. Declaring it is what puts Hold and Release in the link editor, where they meet
+`ramp_start` and `ramp_stop` on the far side: hold a key, the lamp runs up; let go, it stops
+where it got to.
 
-What it would take is a way for a driver to ask core to wake it after N milliseconds. Then the
-Pico could do the discrimination Lutron expects of a listener, and `held`/`released` would meet
-`ramp_start`/`ramp_stop` on the far side — that pair is gated on `supports_ramp`, which the
-dimmer here declares, and its own doc says it exists "for held keypad buttons".
+One clock per key, named for the key, so a second press moves it rather than leaving one
+running. The contract has no `pressed` at all and `released` means "a long press ended" — this
+driver sent both for a while, core refused both, and every press did nothing.
 
 ## Occupancy is an area, not a sensor
 

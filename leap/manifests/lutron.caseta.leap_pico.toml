@@ -22,7 +22,7 @@ parent = "lutron.caseta.leap_bridge"
 id = 1
 type = "keypad"
 primary = true
-capabilities = { key_count = 5, key_labels = "Button 1,Button 2,Button 3,Button 4,Button 5" }
+capabilities = { key_count = 5, key_labels = "Button 1,Button 2,Button 3,Button 4,Button 5", has_hold = true }
 
 [[control]]
 id = 1

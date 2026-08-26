@@ -190,6 +190,18 @@ const PICO_KEYS: &[(&str, &[(u64, &str)])] = &[
     ),
 ];
 
+/// How long a key must stay down before it counts as held rather than pressed.
+///
+/// Half a second, which is the line every keypad in the world draws in roughly the same place:
+/// long enough that an ordinary press never crosses it, short enough that somebody holding a
+/// button to dim does not wonder whether it is working.
+///
+/// Lutron does not draw it for us — a Caséta bridge reports `Press` and `Release` and leaves
+/// the decision to whoever is listening. Until `HostCall::After` there was nothing here that
+/// could decide: a driver has no clock, so `has_hold` was false and hold-to-dim could not be
+/// offered on a Pico at all.
+const HOLD_MS: u32 = 500;
+
 /// How long a held keypad button takes to run a lamp from one end of its travel to the other.
 ///
 /// Four seconds, which is what it takes to land on a level somebody wanted rather than to
@@ -679,7 +691,7 @@ impl CasetaLeap {
         (Self::read_on_this_connection(input, "/area"), next)
     }
 
-    fn handle_areas(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
+    fn handle_areas(state: &Value, input: &Args, _include_bridge: bool) -> (SetupStep, Value) {
         if let Some(err) = input.get("error").and_then(Value::as_str) {
             return (
                 SetupStep::Failed { reason: format!("could not read the bridge's areas: {err}") },
@@ -1087,6 +1099,11 @@ fn pico_capabilities(labels: &[&str]) -> BTreeMap<String, Value> {
         // A Pico runs on a coin cell and the bridge knows how it is doing. Declared because
         // `battery_changed` requires it — see the keypad contract.
         ("has_battery".to_string(), json!(true)),
+        // And it can tell a hold from a click, now that a driver can ask to be woken — see
+        // `HOLD_MS`. Lutron reports the press and the release and leaves the line between them
+        // to whoever is listening; this is the listener drawing it. Declaring it is what puts
+        // Hold and Release in the link editor and lets a key run a lamp up while it is down.
+        ("has_hold".to_string(), json!(true)),
     ])
 }
 
@@ -1138,9 +1155,8 @@ impl DriverModule for CasetaLeap {
     }
 
     fn on_event(&self, inst: &mut Instance, _control: LocalId, note: &str, args: &Args) -> Vec<HostCall> {
-        let buttons = pico_buttons(inst);
-        if !buttons.is_empty() {
-            return Self::on_pico_event(&buttons, device_href(inst).as_deref(), note, args);
+        if !pico_buttons(inst).is_empty() {
+            return Self::on_pico_event(inst, note, args);
         }
         // An occupancy group is not a zone and has no level; it is told apart the same way a
         // Pico is, by the property only it carries.
@@ -1232,6 +1248,18 @@ impl DriverModule for CasetaLeap {
 /// This device's own href on the bridge — `/device/6`. Written at adoption; absent on anything
 /// adopted before this driver started asking for it, which is why every use of it is optional
 /// rather than assumed.
+/// One key's hold clock, and the flag that says it went off. The same string does both, so
+/// there is no second place for them to disagree.
+fn held_note(key: u64) -> String {
+    format!("held:{key}")
+}
+
+/// Whether this key crossed into a hold. Read on release to decide what the press turned out
+/// to be — a hold that ended, or a click that never became one.
+fn held_flag(inst: &Instance, key: u64) -> bool {
+    inst.scratch.get(&held_note(key)).and_then(Value::as_bool) == Some(true)
+}
+
 /// The occupancy group this device is, when it is one — `/occupancygroup/2`. Present only on an
 /// occupancy device, which is how everything else tells itself apart from one.
 fn occupancy_href(inst: &Instance) -> Option<String> {
@@ -1707,15 +1735,37 @@ impl CasetaLeap {
     /// `buttons` is this instance's own hrefs, from `pico_buttons` — the same list `on_bind`
     /// subscribed with, so a press on someone else's Pico read over the same connection is
     /// never mistaken for one of these.
-    fn on_pico_event(
-        buttons: &[(u64, String)],
-        mine: Option<&str>,
-        note: &str,
-        args: &Args,
-    ) -> Vec<HostCall> {
+    fn on_pico_event(inst: &mut Instance, note: &str, args: &Args) -> Vec<HostCall> {
+        // The wake-up a press asked for. If it arrives, the key is still down — a release
+        // would have cancelled nothing, but it clears the flag this sets, and the two cannot
+        // both be true at once because they are the same key's one clock.
+        if note == "timer" {
+            let Some(key) = args
+                .get("note")
+                .and_then(Value::as_str)
+                .and_then(|n| n.strip_prefix("held:"))
+                .and_then(|n| n.parse::<u64>().ok())
+            else {
+                return Vec::new();
+            };
+            inst.scratch.insert(held_note(key), json!(true));
+            let mut a = Args::new();
+            a.insert("key".into(), json!(key));
+            return vec![
+                HostCall::notify(1, "held", a),
+                HostCall::SetState {
+                    proxy: 1,
+                    key: "last_action".into(),
+                    value: json!(format!("key {key} held")),
+                },
+            ];
+        }
         if note != "rx" {
             return Vec::new();
         }
+        let buttons = pico_buttons(inst);
+        let mine = device_href(inst);
+        let mine = mine.as_deref();
         let Some(text) = args.get("data").and_then(Value::as_str) else {
             return Vec::new();
         };
@@ -1758,23 +1808,37 @@ impl CasetaLeap {
             // a hold from a click, so every press is a click and there is nothing to wait for.
             // Waiting for the release to be sure would only add the length of somebody's thumb
             // to every light in the house.
+            // A press starts a clock and says nothing yet; what it turns out to be is decided
+            // by which happens first, the wake-up or the release. That is the discrimination
+            // Lutron expects of a listener and could not be done here until a driver could ask
+            // to be woken — see `HOLD_MS` and `HostCall::After`.
             match status.pointer("/ButtonEvent/EventType").and_then(Value::as_str) {
-                Some("Press") => {}
-                // Real, and nothing to say about it: the click was already reported. Kept as an
-                // arm rather than a fallthrough so a firmware that sends something else still
-                // reaches the `continue` below.
-                Some("Release") => continue,
+                Some("Press") => {
+                    // Restarts rather than stacks: one note per key, so a second press on the
+                    // same key moves that key's clock instead of leaving one running.
+                    out.push(HostCall::After { ms: HOLD_MS, note: held_note(key) });
+                    continue;
+                }
+                Some("Release") => {}
                 _ => continue, // a firmware shape this driver does not know yet
+            }
+
+            // Let go. If the wake-up already came, the hold was reported and this ends it;
+            // otherwise it never crossed the line and was a click all along.
+            let was_held = held_flag(inst, key);
+            let name = if was_held { "released" } else { "clicked" };
+            if was_held {
+                inst.scratch.remove(&held_note(key));
             }
             let mut a = Args::new();
             a.insert("key".into(), json!(key));
-            out.push(HostCall::notify(1, "clicked", a));
+            out.push(HostCall::notify(1, name, a));
             // Same reasoning as the dimmer's own tile: a keypad has nothing else to draw, and
             // one showing blank forever reads as broken rather than idle.
             out.push(HostCall::SetState {
                 proxy: 1,
                 key: "last_action".into(),
-                value: json!(format!("key {key} clicked")),
+                value: json!(format!("key {key} {name}")),
             });
         }
         out
@@ -1786,6 +1850,15 @@ export_driver!(CasetaLeap);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Pico as it is once adopted: its own href, and the keys the bridge gave it.
+    fn a_pico() -> Instance {
+        let mut inst = Instance::default();
+        inst.properties.insert("Device href".into(), json!("/device/6"));
+        inst.properties.insert("Button 1 href".into(), json!("/button/9"));
+        inst.properties.insert("Button 2 href".into(), json!("/button/10"));
+        inst
+    }
 
     /// The two pieces of Lutron knowledge that used to live in the controller.
     ///
@@ -1873,8 +1946,8 @@ mod tests {
     fn every_notification_this_driver_sends_is_one_its_contract_allows() {
         let registry = driver_sdk::proxy::ProxyRegistry::bundled().expect("bundled contracts");
         let claims: &[(&str, &[(&str, Value)], &[&str])] = &[
-            ("keypad", &[("has_battery", json!(true))],
-                &["clicked", "battery_changed", "online_changed"]),
+            ("keypad", &[("has_battery", json!(true)), ("has_hold", json!(true))],
+                &["clicked", "held", "released", "battery_changed", "online_changed"]),
             ("light", &[("dimmer", json!(true)), ("supports_ramp", json!(true))],
                 &["level_changed", "online_changed"]),
             ("switch", &[], &["switch_changed", "online_changed"]),
@@ -1913,7 +1986,8 @@ mod tests {
             }
         }
 
-        // And the two that started this, still refused — so this test would have caught them.
+        // And the gate itself, still shut for a keypad that cannot tell a hold from a click.
+        // `pressed` has never existed at all; `released` exists and is not for this device.
         let keypad = registry.get("keypad").expect("keypad contract");
         let quiet = keypad
             .resolve(&BTreeMap::from([("has_hold".to_string(), json!(false))]))
@@ -2118,7 +2192,7 @@ mod tests {
     /// for every device behind it down one connection, so both have to be checked against ours.
     #[test]
     fn a_picos_battery_is_read_from_its_own_status_and_nobody_elses() {
-        let buttons = vec![(1u64, "/button/9".to_string())];
+        let mut inst = a_pico();
         let frame = |body: &str| {
             let mut args = Args::new();
             args.insert("data".into(), json!(body));
@@ -2129,7 +2203,7 @@ mod tests {
             "{\"Body\":{\"DeviceStatus\":{\"Device\":{\"href\":\"/device/6\"},",
             "\"BatteryStatus\":{\"LevelState\":\"Low\"}}}}\n"
         );
-        let calls = CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &frame(mine));
+        let calls = CasetaLeap::on_pico_event(&mut inst, "rx", &frame(mine));
         match calls.as_slice() {
             [HostCall::Notify { name, args, .. }] => {
                 assert_eq!(name, "battery_changed");
@@ -2143,14 +2217,14 @@ mod tests {
             "{\"Body\":{\"DeviceStatus\":{\"Device\":{\"href\":\"/device/9\"},",
             "\"BatteryStatus\":{\"LevelState\":\"Low\"}}}}\n"
         );
-        assert!(CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &frame(theirs)).is_empty());
+        assert!(CasetaLeap::on_pico_event(&mut inst, "rx", &frame(theirs)).is_empty());
 
         // A level this driver does not recognise says nothing rather than inventing a number.
         let odd = concat!(
             "{\"Body\":{\"DeviceStatus\":{\"Device\":{\"href\":\"/device/6\"},",
             "\"BatteryStatus\":{\"LevelState\":\"Flurgh\"}}}}\n"
         );
-        assert!(CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &frame(odd)).is_empty());
+        assert!(CasetaLeap::on_pico_event(&mut inst, "rx", &frame(odd)).is_empty());
     }
 
     /// Every zone behind the bridge looks the same on the wire, so what tells them apart is the
@@ -2406,42 +2480,63 @@ mod tests {
         }
     }
 
+    /// What a press turns out to be, decided by which happens first: the wake-up or the release.
+    ///
+    /// The bug this replaced: the driver sent `pressed` and `released`, and core refused both —
+    /// the keypad contract has no `pressed`, and `released` means "a long press ended" and is
+    /// gated behind `has_hold`. Every press did nothing, and the only sign was a line in the log
+    /// about an undeclared capability.
     #[test]
-    fn a_press_is_reported_as_the_click_every_keypad_has() {
-        let buttons = vec![(1u64, "/button/9".to_string()), (2u64, "/button/10".to_string())];
-        let mut args = Args::new();
-        args.insert(
-            "data".into(),
-            json!(concat!(
-                // Somebody else's Pico on the same event stream — must be ignored.
-                "{\"Body\":{\"ButtonStatus\":{\"Button\":{\"href\":\"/button/99\"},",
-                "\"ButtonEvent\":{\"EventType\":\"Press\"}}}}\n",
-                "{\"Body\":{\"ButtonStatus\":{\"Button\":{\"href\":\"/button/10\"},",
-                "\"ButtonEvent\":{\"EventType\":\"Press\"}}}}\n",
-                "{\"Body\":{\"ButtonStatus\":{\"Button\":{\"href\":\"/button/10\"},",
-                "\"ButtonEvent\":{\"EventType\":\"Release\"}}}}\n",
-            )),
+    fn a_short_press_is_a_click_and_a_long_one_is_a_hold_then_a_release() {
+        let mut inst = a_pico();
+        let frame = |body: String| {
+            let mut a = Args::new();
+            a.insert("data".into(), json!(body));
+            a
+        };
+        let event = |href: &str, what: &str| format!(
+            "{{\"Body\":{{\"ButtonStatus\":{{\"Button\":{{\"href\":\"{href}\"}},\"ButtonEvent\":{{\"EventType\":\"{what}\"}}}}}}}}\n"
         );
-        let calls = CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &args);
-
-        let notify_names: Vec<&str> = calls
-            .iter()
-            .filter_map(|c| match c {
-                HostCall::Notify { name, args, .. } if args.get("key") == Some(&json!(2)) => {
-                    Some(name.as_str())
-                }
+        let named = |calls: &[HostCall]| -> Vec<String> {
+            calls.iter().filter_map(|c| match c {
+                HostCall::Notify { name, .. } => Some(name.clone()),
                 _ => None,
-            })
-            .collect();
-        // The bug this pins: this used to send `pressed` and `released`, and core refused both —
-        // the keypad contract has no `pressed` at all, and `released` means "a long press
-        // ended" and is gated behind `has_hold`. Every press did nothing, and the only sign was
-        // one line in the log about an undeclared capability. `clicked` is the one every keypad
-        // has and the one every rule is written against.
-        assert_eq!(notify_names, vec!["clicked"], "one click on the press, nothing on the release");
+            }).collect()
+        };
 
-        // An event that is neither Press nor Release, and one whose note is not `rx` at all:
-        // both produce nothing rather than a guess.
-        assert!(CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "not-rx", &args).is_empty());
+        // A press says nothing yet: it starts a clock for that key and waits.
+        let started = CasetaLeap::on_pico_event(&mut inst, "rx", &frame(event("/button/10", "Press")));
+        assert!(named(&started).is_empty(), "a press is not yet a click");
+        match started.as_slice() {
+            [HostCall::After { ms, note }] => {
+                assert_eq!(*ms, HOLD_MS);
+                assert_eq!(note, "held:2", "one clock, named for the key it belongs to");
+            }
+            other => panic!("expected a wake-up to be asked for, got {other:?}"),
+        }
+
+        // Let go before it goes off: a click, and no hold was ever reported.
+        let quick = CasetaLeap::on_pico_event(&mut inst, "rx", &frame(event("/button/10", "Release")));
+        assert_eq!(named(&quick), vec!["clicked"]);
+
+        // Hold it instead. The wake-up arrives first, so the hold is reported...
+        CasetaLeap::on_pico_event(&mut inst, "rx", &frame(event("/button/10", "Press")));
+        let mut woken = Args::new();
+        woken.insert("note".into(), json!("held:2"));
+        assert_eq!(named(&CasetaLeap::on_pico_event(&mut inst, "timer", &woken)), vec!["held"]);
+
+        // ...and letting go ends it rather than counting as a click, which is what makes
+        // `held` → ramp and `released` → stop a pair rather than two unrelated rules.
+        let ended = CasetaLeap::on_pico_event(&mut inst, "rx", &frame(event("/button/10", "Release")));
+        assert_eq!(named(&ended), vec!["released"]);
+
+        // And the next press is a fresh question, not a hold left over.
+        CasetaLeap::on_pico_event(&mut inst, "rx", &frame(event("/button/10", "Press")));
+        let again = CasetaLeap::on_pico_event(&mut inst, "rx", &frame(event("/button/10", "Release")));
+        assert_eq!(named(&again), vec!["clicked"], "the hold flag has to be cleared");
+
+        // Somebody else's Pico on the same connection is still ignored.
+        assert!(CasetaLeap::on_pico_event(&mut inst, "rx", &frame(event("/button/99", "Press"))).is_empty());
+        assert!(CasetaLeap::on_pico_event(&mut inst, "not-rx", &Args::new()).is_empty());
     }
 }
