@@ -1,0 +1,40 @@
+[driver]
+id = "lutron.caseta.leap_occupancy"
+name = "Lutron Caséta Occupancy"
+manufacturer = "Lutron"
+version = "1.0.0"
+runtime = "wasm"
+# What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
+# installer change it from the Logs page; a driver that declares nothing sits at `info` with
+# no control. Everything it prints rather than logs is taken as `debug` and held to this too.
+log_level = "info"
+parent = "lutron.caseta.leap_bridge"
+
+# An area's occupancy rather than a sensor's. Lutron models it that way and it is the more
+# useful shape: two sensors covering one room are one answer to "is anybody in here", and a
+# rule written against either one alone is a rule that turns the lights off on somebody sitting
+# in the half of the room the other sensor watches.
+#
+# `auto_clear_seconds` is left at zero deliberately. The bridge holds its own timer and sends
+# the clear itself, so core clearing on a timer of its own would fight it — see the `sensor`
+# contract, which draws exactly that line.
+[[proxy]]
+id = 1
+type = "sensor"
+primary = true
+capabilities = { kind = "occupancy", is_boolean = true }
+
+[[control]]
+id = 1
+kind = "network"
+name = "LEAP"
+port = 8081
+tls = true
+keepalive = true
+heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/ping"}}'
+heartbeat_secs = 60
+
+[[property]]
+name = "Occupancy href"
+type = "string"
+tooltip = "The area's occupancy group on the bridge — filled in automatically when adopted"

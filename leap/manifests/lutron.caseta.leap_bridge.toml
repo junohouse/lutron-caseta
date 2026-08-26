@@ -8,6 +8,12 @@ version = "1.0.0"
 product = "Lutron Caséta"
 kind = "light"
 runtime = "wasm"
+# The bridge holds the house's Caséta scenes, and core only sends scene requests to a driver
+# that says it can take them — see `Manifest::scene_control`. They are borrowed and stay
+# borrowed: a virtual button is programmed in the Caséta app, this driver has no way to read
+# back what it does, and pretending otherwise would put a Juno-owned scene in an app that has
+# never heard of Juno.
+scene_control = true
 # What this driver is worth hearing when nothing is wrong. Declaring it is also what lets an
 # installer change it from the Logs page; a driver that declares nothing sits at `info` with
 # no control. Everything it prints rather than logs is taken as `debug` and held to this too.
@@ -41,6 +47,22 @@ tooltip = "Issued by the bridge during pairing"
 name = "CA certificate"
 type = "password"
 tooltip = "The bridge's own signing certificate, issued during pairing"
+
+# The bridge holds a connection of its own, which it did not until scenes.
+#
+# Its children each hold one for their own zone, and none of them is the right place to ask what
+# the *bridge* knows: `/virtualbutton` is the bridge's list, and recalling one is the bridge's
+# command. A driver reading its parent's collections down a dimmer's socket would be a dimmer
+# speaking for the house.
+[[control]]
+id = 1
+kind = "network"
+name = "LEAP"
+port = 8081
+tls = true
+keepalive = true
+heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/ping"}}'
+heartbeat_secs = 60
 
 [discovery]
 mdns = ["_lutron._tcp"]

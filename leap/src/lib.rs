@@ -48,6 +48,7 @@ const PICO_ID: &str = "lutron.caseta.leap_pico";
 const SWITCH_ID: &str = "lutron.caseta.leap_switch";
 const FAN_ID: &str = "lutron.caseta.leap_fan";
 const SHADE_ID: &str = "lutron.caseta.leap_shade";
+const OCCUPANCY_ID: &str = "lutron.caseta.leap_occupancy";
 
 /// What a zone behind this bridge turns out to be.
 ///
@@ -643,7 +644,110 @@ impl CasetaLeap {
         if any_pico {
             return Self::request_buttons(state, input, include_bridge, devices);
         }
-        (SetupStep::done(Self::candidates(state, include_bridge, &devices, &[])), Value::Null)
+        Self::request_areas(state, input, include_bridge, devices, Vec::new())
+    }
+
+    /// The names of the rooms the bridge knows, for the occupancy groups that follow: a group
+    /// is identified by its area and by nothing else, so `/occupancygroup` alone would offer
+    /// "Occupancy" three times with no way to tell which room each one watches.
+    fn request_areas(
+        state: &Value,
+        input: &Args,
+        include_bridge: bool,
+        devices: Vec<Value>,
+        buttons: Vec<Value>,
+    ) -> (SetupStep, Value) {
+        let mut next = with_fields(
+            state,
+            &[
+                ("stage", "listing_areas"),
+                ("include_bridge", if include_bridge { "true" } else { "false" }),
+                ("tries", "0"),
+            ],
+        );
+        if let Value::Object(ref mut m) = next {
+            m.insert("devices_json".into(), Value::Array(devices));
+            m.insert("buttons_json".into(), Value::Array(buttons));
+        }
+        (Self::read_on_this_connection(input, "/area"), next)
+    }
+
+    fn handle_areas(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
+        if let Some(err) = input.get("error").and_then(Value::as_str) {
+            return (
+                SetupStep::Failed { reason: format!("could not read the bridge's areas: {err}") },
+                Value::Null,
+            );
+        }
+        let response = leap_answer(input.get("received").and_then(Value::as_str).unwrap_or(""));
+        let Some(areas) = response.pointer("/Body/Areas").and_then(Value::as_array).cloned() else {
+            return Self::read_again(state, input, "listing_areas").unwrap_or((
+                SetupStep::Failed { reason: "the bridge did not answer with its areas".into() },
+                Value::Null,
+            ));
+        };
+        let mut next = with_fields(
+            state,
+            &[("stage", "listing_occupancy"), ("tries", "0")],
+        );
+        if let Value::Object(ref mut m) = next {
+            m.insert("areas_json".into(), Value::Array(areas));
+        }
+        (Self::read_on_this_connection(input, "/occupancygroup"), next)
+    }
+
+    fn handle_occupancy(state: &Value, input: &Args, include_bridge: bool) -> (SetupStep, Value) {
+        // A bridge with no occupancy at all still finishes: the devices found earlier are the
+        // answer, and a failure here must not throw them away.
+        let groups = input
+            .get("error")
+            .is_none()
+            .then(|| {
+                leap_answer(input.get("received").and_then(Value::as_str).unwrap_or(""))
+                    .pointer("/Body/OccupancyGroups")
+                    .and_then(Value::as_array)
+                    .cloned()
+            })
+            .flatten();
+        let Some(groups) = groups else {
+            return match Self::read_again(state, input, "listing_occupancy") {
+                Some(again) => again,
+                None => (SetupStep::done(Self::all_candidates(state, include_bridge, &[])), Value::Null),
+            };
+        };
+        (
+            SetupStep::done(Self::all_candidates(state, include_bridge, &groups)),
+            Value::Null,
+        )
+    }
+
+    /// Everything the flow gathered, as one list. The devices and their buttons were carried
+    /// through `state`; the areas and groups arrived last.
+    fn all_candidates(state: &Value, include_bridge: bool, groups: &[Value]) -> Vec<Candidate> {
+        let devices: Vec<Value> =
+            state.get("devices_json").and_then(Value::as_array).cloned().unwrap_or_default();
+        let buttons: Vec<Value> =
+            state.get("buttons_json").and_then(Value::as_array).cloned().unwrap_or_default();
+        let areas: Vec<Value> =
+            state.get("areas_json").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut out = Self::candidates(state, include_bridge, &devices, &buttons);
+        out.extend(occupancy_candidates(&areas, groups));
+        out
+    }
+
+    /// A read down the connection this flow already has open.
+    fn read_on_this_connection(input: &Args, url: &str) -> SetupStep {
+        let body = json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": url } });
+        SetupStep::Session {
+            session: input.get("session").and_then(Value::as_u64).map(|v| v as u32),
+            open: None,
+            accept: None,
+            send: leap_line(&body),
+            send_bytes: Vec::new(),
+            read_ms: 6000,
+            close: false,
+            note: "list".into(),
+        }
     }
 
     /// One more read, made only when something found in `/device` needs it — most bridges have
@@ -712,7 +816,7 @@ impl CasetaLeap {
             ));
         };
         let devices: Vec<Value> = state.get("devices_json").and_then(Value::as_array).cloned().unwrap_or_default();
-        (SetupStep::done(Self::candidates(state, include_bridge, &devices, &buttons)), Value::Null)
+        Self::request_areas(state, input, include_bridge, devices, buttons)
     }
 
     fn candidates(state: &Value, include_bridge: bool, devices: &[Value], buttons: &[Value]) -> Vec<Candidate> {
@@ -845,6 +949,56 @@ fn caseta_name(device: &Value) -> (String, String) {
     (name, room.to_string())
 }
 
+/// The areas that have somebody watching them, as sensors.
+///
+/// A group with no `AssociatedSensors` is an area Lutron made a slot for and nobody put a
+/// sensor in — every Caséta bridge has one per room whether or not anything reports. Offering
+/// those would put a motion sensor in the house for every room the installer ever named, none
+/// of which would ever fire.
+fn occupancy_candidates(areas: &[Value], groups: &[Value]) -> Vec<Candidate> {
+    let named = |href: &str| {
+        areas
+            .iter()
+            .find(|a| a.get("href").and_then(Value::as_str) == Some(href))
+            .and_then(|a| a.get("Name").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string()
+    };
+
+    groups
+        .iter()
+        .filter(|g| {
+            g.get("AssociatedSensors")
+                .and_then(Value::as_array)
+                .is_some_and(|sensors| !sensors.is_empty())
+        })
+        .filter_map(|g| {
+            let href = g.get("href").and_then(Value::as_str)?;
+            let area = g
+                .pointer("/AssociatedAreas/0/Area/href")
+                .and_then(Value::as_str)
+                .map(named)
+                .unwrap_or_default();
+            // "Kitchen Occupancy", the way `pylutron-caseta` names them, because a house with
+            // four of these needs to be able to tell them apart in a list of triggers.
+            let label = if area.is_empty() {
+                "Occupancy".to_string()
+            } else {
+                format!("{area} Occupancy")
+            };
+            Some(Candidate {
+                label,
+                room: area,
+                kind: "sensor".into(),
+                driver_id: OCCUPANCY_ID.into(),
+                properties: BTreeMap::from([("Occupancy href".to_string(), json!(href))]),
+                verified: "found on bridge".into(),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
 /// Any Pico remote — `Pico2Button`, `Pico3ButtonRaiseLower`, `Pico4Button` and the rest all
 /// start with it, and this driver treats every one of them the same way (see `PICO_ID`'s
 /// manifest for the ceiling that puts a real name on).
@@ -943,6 +1097,8 @@ impl DriverModule for CasetaLeap {
             return match field(state, "stage").as_str() {
                 "listing" => Self::handle_device_list(state, input, false),
                 "listing_buttons" => Self::handle_buttons(state, input, false),
+                "listing_areas" => Self::handle_areas(state, input, false),
+                "listing_occupancy" => Self::handle_occupancy(state, input, false),
                 _ => Self::request_device_list(&with_fields(state, &[("stage", "listing")])),
             };
         }
@@ -956,6 +1112,8 @@ impl DriverModule for CasetaLeap {
             "pair_sent" => Self::handle_pair_response(state, input),
             "listing" => Self::handle_device_list(state, input, true),
             "listing_buttons" => Self::handle_buttons(state, input, true),
+            "listing_areas" => Self::handle_areas(state, input, true),
+            "listing_occupancy" => Self::handle_occupancy(state, input, true),
             _ => Self::ask_address(state, input),
         }
     }
@@ -977,7 +1135,45 @@ impl DriverModule for CasetaLeap {
         if !buttons.is_empty() {
             return Self::on_pico_event(&buttons, device_href(inst).as_deref(), note, args);
         }
+        // An occupancy group is not a zone and has no level; it is told apart the same way a
+        // Pico is, by the property only it carries.
+        if let Some(group) = occupancy_href(inst) {
+            return Self::on_occupancy_event(&group, note, args);
+        }
+        // The bridge answering the one question it was asked at bind.
+        if zone(inst).is_none() {
+            return Self::on_bridge_event(note, args);
+        }
         Self::on_dimmer_event(inst, note, args)
+    }
+
+    /// Provider-owned scenes, handed to core as borrowed handles. Recall is all they support and
+    /// all they should: what a virtual button does was decided in the Caséta app, and this
+    /// driver has no way to read it back, let alone write it.
+    fn on_scene(&self, _inst: &mut Instance, request: &SceneRequest) -> SceneResponse {
+        match &request.operation {
+            SceneOperation::Recall { .. } => match request.resource.as_deref() {
+                Some(resource) if resource.starts_with("/virtualbutton/") => SceneResponse {
+                    calls: vec![tx(&press_virtual_button(resource))],
+                    ..Default::default()
+                },
+                _ => SceneResponse {
+                    problem: Some("caseta-leap: not a Caséta scene".into()),
+                    ..Default::default()
+                },
+            },
+            // Nothing here owns a Caséta scene, so there is nothing to create, change or
+            // detach. Saying so is the honest answer; pretending would put a Juno-owned scene
+            // in an app that has never heard of Juno.
+            _ => SceneResponse {
+                problem: Some(
+                    "caseta-leap: Caséta scenes are programmed in the Caséta app and can only be \
+                     recalled from here"
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        }
     }
 
     fn on_bind(&self, inst: &mut Instance) -> Vec<HostCall> {
@@ -990,6 +1186,22 @@ impl DriverModule for CasetaLeap {
         if let Some(z) = zone(inst) {
             out.push(tx(&subscribe(&z)));
         }
+        // An area's occupancy. One subscription covers every group on the bridge, and each
+        // device filters the feed down to its own — see `on_occupancy_event`.
+        if occupancy_href(inst).is_some() {
+            out.push(tx(&subscribe_occupancy()));
+            return out;
+        }
+
+        // The bridge itself. It has no zone and no buttons; what it has is the house's scenes.
+        if inst.property("Client certificate").as_str().is_some_and(|c| !c.is_empty())
+            && zone(inst).is_none()
+            && pico_buttons(inst).is_empty()
+        {
+            out.push(tx(&read_virtual_buttons()));
+            return out;
+        }
+
         let buttons = pico_buttons(inst);
         for (_, href) in &buttons {
             out.push(tx(&subscribe_button(href)));
@@ -1013,6 +1225,20 @@ impl DriverModule for CasetaLeap {
 /// This device's own href on the bridge — `/device/6`. Written at adoption; absent on anything
 /// adopted before this driver started asking for it, which is why every use of it is optional
 /// rather than assumed.
+/// The occupancy group this device is, when it is one — `/occupancygroup/2`. Present only on an
+/// occupancy device, which is how everything else tells itself apart from one.
+fn occupancy_href(inst: &Instance) -> Option<String> {
+    inst.property("Occupancy href")
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Ask for every group's occupancy, and keep hearing about them.
+fn subscribe_occupancy() -> Value {
+    json!({ "CommuniqueType": "SubscribeRequest", "Header": { "Url": "/occupancygroup/status" } })
+}
+
 fn device_href(inst: &Instance) -> Option<String> {
     inst.property("Device href")
         .as_str()
@@ -1130,6 +1356,22 @@ fn zone_command(zone: &str, command: Value) -> Value {
         "CommuniqueType": "CreateRequest",
         "Header": { "Url": format!("{zone}/commandprocessor") },
         "Body": { "Command": command },
+    })
+}
+
+/// Every scene the bridge holds. A Caséta scene is a "virtual button": programmed in the app,
+/// pressed by anything that can reach the bridge.
+fn read_virtual_buttons() -> Value {
+    json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": "/virtualbutton" } })
+}
+
+/// Recall one. There is no "set this scene to these levels" — a virtual button is pressed, and
+/// what it does was decided in the Caséta app. That is exactly what a *borrowed* scene is.
+fn press_virtual_button(resource: &str) -> Value {
+    json!({
+        "CommuniqueType": "CreateRequest",
+        "Header": { "Url": format!("{resource}/commandprocessor") },
+        "Body": { "Command": { "CommandType": "PressAndRelease" } },
     })
 }
 
@@ -1364,6 +1606,82 @@ impl CasetaLeap {
             }
             inst.scratch.insert("on".into(), json!(level > 0));
             out.push(report(level));
+        }
+        out
+    }
+
+    /// What the bridge itself hears: the scene list it asked for at bind.
+    ///
+    /// Filtered on `IsProgrammed`, because the bridge keeps fifty virtual buttons whether or not
+    /// anybody has put anything on them — offering `Button 37` as a scene is offering a switch
+    /// wired to nothing.
+    fn on_bridge_event(note: &str, args: &Args) -> Vec<HostCall> {
+        if note != "rx" {
+            return Vec::new();
+        }
+        let Some(text) = args.get("data").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        for line in text.split('\n').map(str::trim).filter(|l| !l.is_empty()) {
+            let Ok(msg) = driver_sdk::serde_json::from_str::<Value>(line) else { continue };
+            let Some(buttons) = msg.pointer("/Body/VirtualButtons").and_then(Value::as_array) else {
+                continue;
+            };
+            let scenes: Vec<BorrowedSceneSnapshot> = buttons
+                .iter()
+                .filter(|b| b.get("IsProgrammed").and_then(Value::as_bool) == Some(true))
+                .filter_map(|b| {
+                    let title = b.get("Name").and_then(Value::as_str)?.trim();
+                    let resource = b.get("href").and_then(Value::as_str)?;
+                    (!title.is_empty()).then(|| BorrowedSceneSnapshot {
+                        title: title.to_string(),
+                        resource: resource.to_string(),
+                        // No steps: LEAP does not say what a virtual button does, and a scene
+                        // this driver cannot read is one core must not claim to know.
+                        ..Default::default()
+                    })
+                })
+                .collect();
+            return vec![HostCall::BorrowedScenes { scenes }];
+        }
+        Vec::new()
+    }
+
+    /// An area's occupancy, as the bridge reports it for every group at once.
+    fn on_occupancy_event(mine: &str, note: &str, args: &Args) -> Vec<HostCall> {
+        if note != "rx" {
+            return Vec::new();
+        }
+        let Some(text) = args.get("data").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for line in text.split('\n').map(str::trim).filter(|l| !l.is_empty()) {
+            let Ok(msg) = driver_sdk::serde_json::from_str::<Value>(line) else { continue };
+            // One status, or the whole list — the bridge sends both shapes, a single push when
+            // something changes and a multiple in reply to the read at bind.
+            let one = msg.pointer("/Body/OccupancyGroupStatus").into_iter();
+            let many = msg
+                .pointer("/Body/OccupancyGroupStatuses")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten();
+            for status in one.chain(many) {
+                if status.pointer("/OccupancyGroup/href").and_then(Value::as_str) != Some(mine) {
+                    continue; // another area, on the same bridge-wide feed
+                }
+                // `Unknown` is not a clear. A sensor that has not reported since the bridge
+                // restarted has said nothing, and reporting that as "nobody is here" turns the
+                // lights off in a room with somebody in it.
+                let detected = match status.get("OccupancyStatus").and_then(Value::as_str) {
+                    Some("Occupied") => true,
+                    Some("Unoccupied") => false,
+                    _ => continue,
+                };
+                let mut a = Args::new();
+                a.insert("detected".into(), json!(detected));
+                out.push(HostCall::notify(1, "detected_changed", a));
+            }
         }
         out
     }
@@ -1850,6 +2168,100 @@ mod tests {
         let [HostCall::Tx { data, .. }] = calls.as_slice() else { panic!("expected one write") };
         let sent: Value = driver_sdk::serde_json::from_slice(data).expect("valid JSON");
         assert_eq!(sent["Body"]["Command"]["Parameter"][0]["Value"], 0, "on, so a toggle is off");
+    }
+
+    /// The bug this pins: every Caséta bridge has an occupancy group per area whether or not
+    /// anybody put a sensor in it — this one has three and no sensors at all. Offering those
+    /// would put a motion sensor in the house for every room the installer ever named.
+    #[test]
+    fn only_an_area_with_a_sensor_in_it_is_offered_as_one() {
+        let areas = vec![
+            json!({ "href": "/area/2", "Name": "Master Bedroom" }),
+            json!({ "href": "/area/4", "Name": "Kitchen" }),
+        ];
+        let groups = vec![
+            // A slot with nothing in it — what a real bridge is full of.
+            json!({ "href": "/occupancygroup/1", "AssociatedAreas": [{ "Area": { "href": "/area/2" } }] }),
+            json!({
+                "href": "/occupancygroup/3",
+                "AssociatedAreas": [{ "Area": { "href": "/area/4" } }],
+                "AssociatedSensors": [{ "OccupancySensor": { "href": "/device/8" } }],
+            }),
+        ];
+
+        let found = occupancy_candidates(&areas, &groups);
+        let [sensor] = found.as_slice() else { panic!("expected one, got {found:?}") };
+        assert_eq!(sensor.label, "Kitchen Occupancy");
+        assert_eq!(sensor.room, "Kitchen", "it goes in the room it watches");
+        assert_eq!(sensor.driver_id, OCCUPANCY_ID);
+        assert_eq!(sensor.properties["Occupancy href"], json!("/occupancygroup/3"));
+    }
+
+    /// One feed carries every area on the bridge, and `Unknown` is not a clear.
+    #[test]
+    fn occupancy_is_filtered_to_this_area_and_unknown_says_nothing() {
+        let frame = |body: &str| {
+            let mut a = Args::new();
+            a.insert("data".into(), json!(body));
+            a
+        };
+        let status = |group: &str, state: &str| {
+            format!(
+                "{{\"Body\":{{\"OccupancyGroupStatus\":{{\"OccupancyGroup\":{{\"href\":\"{group}\"}},\
+                 \"OccupancyStatus\":\"{state}\"}}}}}}\n"
+            )
+        };
+
+        let calls = CasetaLeap::on_occupancy_event("/occupancygroup/3", "rx", &frame(&status("/occupancygroup/3", "Occupied")));
+        match calls.as_slice() {
+            [HostCall::Notify { name, args, .. }] => {
+                assert_eq!(name, "detected_changed");
+                assert_eq!(args["detected"], json!(true));
+            }
+            other => panic!("expected a detection, got {other:?}"),
+        }
+
+        // The room next door, on the same bridge-wide feed.
+        assert!(CasetaLeap::on_occupancy_event(
+            "/occupancygroup/3", "rx", &frame(&status("/occupancygroup/9", "Occupied")),
+        ).is_empty());
+
+        // A sensor that has said nothing since the bridge restarted has said nothing. Reporting
+        // that as "nobody is here" turns the lights off in a room with somebody in it.
+        assert!(CasetaLeap::on_occupancy_event(
+            "/occupancygroup/3", "rx", &frame(&status("/occupancygroup/3", "Unknown")),
+        ).is_empty());
+
+        // And the whole-list shape, which is what the read at bind answers with.
+        let many = concat!(
+            "{\"Body\":{\"OccupancyGroupStatuses\":[",
+            "{\"OccupancyGroup\":{\"href\":\"/occupancygroup/1\"},\"OccupancyStatus\":\"Occupied\"},",
+            "{\"OccupancyGroup\":{\"href\":\"/occupancygroup/3\"},\"OccupancyStatus\":\"Unoccupied\"}]}}\n"
+        );
+        match CasetaLeap::on_occupancy_event("/occupancygroup/3", "rx", &frame(many)).as_slice() {
+            [HostCall::Notify { args, .. }] => assert_eq!(args["detected"], json!(false)),
+            other => panic!("expected one clear for this area only, got {other:?}"),
+        }
+    }
+
+    /// A virtual button nobody programmed is a switch wired to nothing.
+    #[test]
+    fn only_a_programmed_virtual_button_is_offered_as_a_scene() {
+        let mut a = Args::new();
+        a.insert("data".into(), json!(concat!(
+            "{\"Body\":{\"VirtualButtons\":[",
+            "{\"href\":\"/virtualbutton/1\",\"Name\":\"Arriving Home\",\"IsProgrammed\":true},",
+            "{\"href\":\"/virtualbutton/3\",\"Name\":\"Button 3\",\"IsProgrammed\":false}]}}\n"
+        )));
+        match CasetaLeap::on_bridge_event("rx", &a).as_slice() {
+            [HostCall::BorrowedScenes { scenes }] => {
+                assert_eq!(scenes.len(), 1, "the unprogrammed one is not a scene");
+                assert_eq!(scenes[0].title, "Arriving Home");
+                assert_eq!(scenes[0].resource, "/virtualbutton/1");
+                assert!(scenes[0].steps.is_empty(), "LEAP does not say what it does");
+            }
+            other => panic!("expected one scene import, got {other:?}"),
+        }
     }
 
     #[test]

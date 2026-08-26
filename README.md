@@ -85,14 +85,43 @@ Fan speeds are the house's words on this side and Lutron's on the wire — a rul
 capability the model decides at adoption: a roller shade offering a tilt control is a control
 that does nothing.
 
-## What this still does not drive
+## Occupancy is an area, not a sensor
 
-Occupancy sensors. They are the one LEAP group that is not a zone — they arrive through
-`/occupancygroup`, a separate collection with its own subscription — so they want their own read
-rather than another `DeviceType` arm.
+Lutron models it that way and it is the more useful shape: two sensors covering one room are one
+answer to "is anybody in here", and a rule written against either one alone switches the lights
+off on somebody sitting in the half of the room the other sensor watches.
 
-The `/virtualbutton` scenes a bridge publishes are also absent. Those are a Caséta scene, which
-is a question about how a provider's scenes meet the house's own, not about this protocol.
+So an occupancy device is an `/occupancygroup`, named after its area — `Kitchen Occupancy`. Only
+the groups with `AssociatedSensors` are offered: every bridge has one group per area whether or
+not anybody installed anything, and adopting those would put a motion sensor in the house for
+every room the installer ever named. This bridge has three and no sensors, which is what that
+filter is for.
+
+`Unknown` is not a clear. A sensor that has said nothing since the bridge restarted has said
+nothing, and reporting that as "nobody is here" is the same failure as the sensor being wrong.
+
+## Scenes are borrowed and stay borrowed
+
+A Caséta scene is a virtual button: programmed in the app, pressed by anything that can reach
+the bridge. LEAP will not say what one does, so core gets a read-only handle it can recall and
+nothing else — `HostCall::BorrowedScenes`, and `PressAndRelease` on the way back. A bridge keeps
+fifty virtual buttons whether or not anybody has put anything on them, so the list is filtered
+on `IsProgrammed`; offering `Button 37` as a scene is offering a switch wired to nothing.
+
+The bridge holds a connection of its own for this. Its children each hold one for their own
+zone, and none of them is the right place to ask what the *bridge* knows.
+
+## The bridge runs out of connections at nine
+
+Measured, not assumed: a Smart Bridge 2 accepts nine concurrent LEAP connections and resets the
+tenth. Core holds one per device, so a house with the bridge and eight children is at the
+ceiling, and the ninth device silently never connects.
+
+That is fine for a handful of Picos and wrong for a real Caséta install. The fix is not in this
+driver — core keys a held connection by device, and everything behind one bridge shares an
+address and a port, so the connections could be shared. `deliver_stream_frame` already fans a
+frame out to every device behind the one that received it, which suggests the design was
+expecting this.
 
 None of the four above has been driven against real hardware — there was none to hand. The wire
 formats come from `pylutron-caseta`, the tests pin the translations in both directions, and the
