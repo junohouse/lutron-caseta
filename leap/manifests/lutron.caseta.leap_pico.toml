@@ -31,6 +31,12 @@ name = "LEAP"
 port = 8081
 tls = true
 keepalive = true
+# The bridge hangs up a client that says nothing — within minutes, confirmed on hardware. Core
+# notices and dials again, but every press in the gap is gone, and presses are the entire point
+# of holding this socket. So it is never idle: `/server/1/status/ping` answers `OnePingResponse`
+# with the LEAP version and touches nothing. See `ControlDecl::heartbeat`.
+heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/ping"}}'
+heartbeat_secs = 60
 
 # No `[[property]]` blocks for the button hrefs. There were five of them — "Button 1 href"
 # through "Button 5 href", identical but for a number spelled out in words — and they declared
