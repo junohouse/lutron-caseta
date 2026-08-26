@@ -31,6 +31,11 @@ heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/p
 heartbeat_secs = 60
 
 [[property]]
+name = "Device href"
+type = "string"
+tooltip = "The device's own href on the bridge — filled in automatically when adopted"
+
+[[property]]
 name = "Zone"
 type = "string"
 tooltip = "The device's zone href on the bridge — filled in automatically when adopted"

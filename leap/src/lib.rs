@@ -667,6 +667,7 @@ impl CasetaLeap {
                 };
                 let mut props = BTreeMap::new();
                 props.insert("Zone".into(), json!(zone));
+                props.insert("Device href".into(), json!(d.get("href").and_then(Value::as_str).unwrap_or("")));
                 out.push(Candidate {
                     label: name,
                     room,
@@ -685,6 +686,10 @@ impl CasetaLeap {
                     continue; // no buttons found for it means nothing to subscribe to
                 }
                 let mut props = BTreeMap::new();
+                // The remote itself, not one of its keys. `/device/<n>/status` is where the
+                // battery lives, and a driver holding five button hrefs still had no way to
+                // name the thing they are on.
+                props.insert("Device href".into(), json!(d.get("href").and_then(Value::as_str).unwrap_or("")));
                 for (i, (href, _)) in keys.iter().enumerate() {
                     props.insert(format!("Button {} href", i + 1), json!(href));
                 }
@@ -817,6 +822,9 @@ fn pico_capabilities(labels: &[&str]) -> BTreeMap<String, Value> {
     BTreeMap::from([
         ("key_count".to_string(), json!(labels.len())),
         ("key_labels".to_string(), json!(labels.join(","))),
+        // A Pico runs on a coin cell and the bridge knows how it is doing. Declared because
+        // `battery_changed` requires it — see the keypad contract.
+        ("has_battery".to_string(), json!(true)),
     ])
 }
 
@@ -860,7 +868,7 @@ impl DriverModule for CasetaLeap {
     fn on_event(&self, inst: &mut Instance, _control: LocalId, note: &str, args: &Args) -> Vec<HostCall> {
         let buttons = pico_buttons(inst);
         if !buttons.is_empty() {
-            return Self::on_pico_event(&buttons, note, args);
+            return Self::on_pico_event(&buttons, device_href(inst).as_deref(), note, args);
         }
         Self::on_dimmer_event(inst, note, args)
     }
@@ -875,8 +883,17 @@ impl DriverModule for CasetaLeap {
         if let Some(z) = zone(inst) {
             out.push(tx(&subscribe(&z)));
         }
-        for (_, href) in pico_buttons(inst) {
-            out.push(tx(&subscribe_button(&href)));
+        let buttons = pico_buttons(inst);
+        for (_, href) in &buttons {
+            out.push(tx(&subscribe_button(href)));
+        }
+        // And how its battery is doing, for the one kind of device here that has one. Asked
+        // once on binding rather than polled: a coin cell does not move in an afternoon, and
+        // the answer arrives on the same connection as everything else.
+        if !buttons.is_empty()
+            && let Some(href) = device_href(inst)
+        {
+            out.push(tx(&read_status(&href)));
         }
         out
     }
@@ -885,6 +902,36 @@ impl DriverModule for CasetaLeap {
 // ---------------------------------------------------------------------------------------
 // The live connection — one zone's on/off/dim, and the status push that keeps it in sync.
 // ---------------------------------------------------------------------------------------
+
+/// This device's own href on the bridge — `/device/6`. Written at adoption; absent on anything
+/// adopted before this driver started asking for it, which is why every use of it is optional
+/// rather than assumed.
+fn device_href(inst: &Instance) -> Option<String> {
+    inst.property("Device href")
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Ask for a device's own status. The battery lives here and nowhere else.
+fn read_status(href: &str) -> Value {
+    json!({ "CommuniqueType": "ReadRequest", "Header": { "Url": format!("{href}/status") } })
+}
+
+/// What the bridge's coarse battery level is worth as the percentage the contract asks for.
+///
+/// Lutron reports a word, not a number: `Good` or `Low`. The keypad contract wants a `u8`, so
+/// something has to be invented, and the honest invention is one that reads correctly on a
+/// battery gauge — full, or nearly empty and worth acting on. Anything unrecognised reports
+/// nothing at all rather than a number nobody can stand behind.
+fn battery_percent(level: &str) -> Option<u8> {
+    match level {
+        "Good" | "Normal" | "Full" => Some(100),
+        "Low" => Some(10),
+        "Critical" => Some(2),
+        _ => None,
+    }
+}
 
 fn zone(inst: &Instance) -> Option<String> {
     inst.property("Zone")
@@ -1023,7 +1070,12 @@ impl CasetaLeap {
     /// `buttons` is this instance's own hrefs, from `pico_buttons` — the same list `on_bind`
     /// subscribed with, so a press on someone else's Pico read over the same connection is
     /// never mistaken for one of these.
-    fn on_pico_event(buttons: &[(u64, String)], note: &str, args: &Args) -> Vec<HostCall> {
+    fn on_pico_event(
+        buttons: &[(u64, String)],
+        mine: Option<&str>,
+        note: &str,
+        args: &Args,
+    ) -> Vec<HostCall> {
         if note != "rx" {
             return Vec::new();
         }
@@ -1034,6 +1086,24 @@ impl CasetaLeap {
         let mut out = Vec::new();
         for line in text.split('\n').map(str::trim).filter(|l| !l.is_empty()) {
             let Ok(msg) = driver_sdk::serde_json::from_str::<Value>(line) else { continue };
+
+            // The remote's own status, which is where its battery is. One reply per remote on a
+            // shared connection, so it has to be checked against ours the same way a press is:
+            // a bridge with four Picos behind it answers for all of them down one socket.
+            if let Some(status) = msg.pointer("/Body/DeviceStatus") {
+                if status.pointer("/Device/href").and_then(Value::as_str) == mine
+                    && let Some(percent) = status
+                        .pointer("/BatteryStatus/LevelState")
+                        .and_then(Value::as_str)
+                        .and_then(battery_percent)
+                {
+                    let mut a = Args::new();
+                    a.insert("percent".into(), json!(percent));
+                    out.push(HostCall::notify(1, "battery_changed", a));
+                }
+                continue;
+            }
+
             let Some(status) = msg.pointer("/Body/ButtonStatus") else { continue };
             let href = status.pointer("/Button/href").and_then(Value::as_str).unwrap_or("");
             let Some(key) = buttons.iter().find(|(_, h)| h == href).map(|(k, _)| *k) else {
@@ -1283,6 +1353,45 @@ mod tests {
         assert!(pico_keys_of(&json!({ "DeviceType": "Pico2Button" }), &buttons).is_empty());
     }
 
+    /// A remote that has been heard from, and one whose battery is going. The bridge answers
+    /// for every device behind it down one connection, so both have to be checked against ours.
+    #[test]
+    fn a_picos_battery_is_read_from_its_own_status_and_nobody_elses() {
+        let buttons = vec![(1u64, "/button/9".to_string())];
+        let frame = |body: &str| {
+            let mut args = Args::new();
+            args.insert("data".into(), json!(body));
+            args
+        };
+
+        let mine = concat!(
+            "{\"Body\":{\"DeviceStatus\":{\"Device\":{\"href\":\"/device/6\"},",
+            "\"BatteryStatus\":{\"LevelState\":\"Low\"}}}}\n"
+        );
+        let calls = CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &frame(mine));
+        match calls.as_slice() {
+            [HostCall::Notify { name, args, .. }] => {
+                assert_eq!(name, "battery_changed");
+                assert_eq!(args["percent"], json!(10), "Low has to read as nearly empty");
+            }
+            other => panic!("expected one battery notification, got {other:?}"),
+        }
+
+        // The Pico in the next room, on the same socket.
+        let theirs = concat!(
+            "{\"Body\":{\"DeviceStatus\":{\"Device\":{\"href\":\"/device/9\"},",
+            "\"BatteryStatus\":{\"LevelState\":\"Low\"}}}}\n"
+        );
+        assert!(CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &frame(theirs)).is_empty());
+
+        // A level this driver does not recognise says nothing rather than inventing a number.
+        let odd = concat!(
+            "{\"Body\":{\"DeviceStatus\":{\"Device\":{\"href\":\"/device/6\"},",
+            "\"BatteryStatus\":{\"LevelState\":\"Flurgh\"}}}}\n"
+        );
+        assert!(CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &frame(odd)).is_empty());
+    }
+
     #[test]
     fn a_pico_event_reports_only_its_own_button_and_only_press_or_release() {
         let buttons = vec![(1u64, "/button/9".to_string()), (2u64, "/button/10".to_string())];
@@ -1299,7 +1408,7 @@ mod tests {
                 "\"ButtonEvent\":{\"EventType\":\"Release\"}}}}\n",
             )),
         );
-        let calls = CasetaLeap::on_pico_event(&buttons, "rx", &args);
+        let calls = CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "rx", &args);
 
         let notify_names: Vec<&str> = calls
             .iter()
@@ -1314,6 +1423,6 @@ mod tests {
 
         // An event that is neither Press nor Release, and one whose note is not `rx` at all:
         // both produce nothing rather than a guess.
-        assert!(CasetaLeap::on_pico_event(&buttons, "not-rx", &args).is_empty());
+        assert!(CasetaLeap::on_pico_event(&buttons, Some("/device/6"), "not-rx", &args).is_empty());
     }
 }

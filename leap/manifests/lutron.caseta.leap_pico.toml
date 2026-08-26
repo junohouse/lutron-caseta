@@ -38,6 +38,15 @@ keepalive = true
 heartbeat = '{"CommuniqueType":"ReadRequest","Header":{"Url":"/server/1/status/ping"}}'
 heartbeat_secs = 60
 
+# The remote's own href on the bridge — `/device/6`. Written by the bridge's setup flow at
+# adoption, like the button hrefs below, and read back to ask `/device/<n>/status` for the
+# battery. Declared rather than left implicit because it is the one property here that names the
+# device itself rather than a key on it.
+[[property]]
+name = "Device href"
+type = "string"
+tooltip = "The remote's own href on the bridge — filled in automatically when adopted"
+
 # No `[[property]]` blocks for the button hrefs. There were five of them — "Button 1 href"
 # through "Button 5 href", identical but for a number spelled out in words — and they declared
 # nothing: no default, not required, and the properties pane renders the keys a device actually
